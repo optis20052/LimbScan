@@ -1,0 +1,45 @@
+# Flutter / Dart
+app/build/
+app/.dart_tool/
+app/**/.dart_tool/
+app/**/build/
+app/.flutter-plugins
+app/.flutter-plugins-dependencies
+app/**/*.iml
+app/android/.gradle/
+app/android/local.properties
+app/**/android/.gradle/
+app/**/android/local.properties
+app/android/key.properties
+app/ios/Pods/
+app/ios/.symlinks/
+app/ios/Flutter/ephemeral/
+app/ios/Flutter/Generated.xcconfig
+app/ios/Flutter/flutter_export_environment.sh
+*.apk
+*.aab
+*.jks
+*.keystore
+
+# Backend
+backend/.venv/
+backend/data/
+backend/**/__pycache__/
+*.pyc
+*.log
+
+# Test scans and reference meshes (personal body data, large; kept on the PC)
+test-data/
+
+# One-off experiments and test scripts
+backend/tools/exp_*.py
+backend/tools/test_*.py
+
+# Secrets
+.env
+*.env
+
+# OS / editors
+.DS_Store
+.idea/
+.vscode/

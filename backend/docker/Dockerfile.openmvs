@@ -1,0 +1,15 @@
+FROM ubuntu:24.04
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends git cmake build-essential ca-certificates \
+    libpng-dev libjpeg-dev libtiff-dev libglu1-mesa-dev libboost-all-dev \
+    libopencv-dev libcgal-dev libeigen3-dev libglfw3-dev libglew-dev \
+    libceres-dev libnanoflann-dev libzstd-dev && rm -rf /var/lib/apt/lists/*
+RUN git clone --depth 1 https://gitlab.com/libeigen/eigen.git --branch 3.4 /eigen || true
+RUN git clone --depth 1 https://github.com/cdcseacave/VCG.git /vcglib
+RUN git clone --recurse-submodules --depth 1 --branch v2.3.0 https://github.com/cdcseacave/openMVS.git /openMVS
+RUN apt-get update && apt-get install -y --no-install-recommends libtinyxml2-dev && rm -rf /var/lib/apt/lists/*
+RUN git clone --depth 1 https://github.com/cdcseacave/TinyEXIF.git /TinyEXIF && mkdir /TinyEXIF/build && cd /TinyEXIF/build && \
+    cmake .. -DBUILD_SHARED_LIBS=ON -DCMAKE_BUILD_TYPE=Release && make -j8 && make install
+RUN mkdir /openMVS/make && cd /openMVS/make && cmake .. -DCMAKE_BUILD_TYPE=Release -DVCG_ROOT=/vcglib \
+      -DOpenMVS_USE_CUDA=OFF -DOpenMVS_USE_PYTHON=OFF -DOpenMVS_BUILD_VIEWER=OFF && make -j14 && make install
+ENV PATH=/usr/local/bin/OpenMVS:$PATH

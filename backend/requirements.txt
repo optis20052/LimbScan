@@ -1,0 +1,16 @@
+fastapi==0.162.0
+manifold3d==3.5.4
+matplotlib==3.11.2
+networkx==3.6.1
+numpy==2.4.6
+open3d==0.20.0
+opencv-contrib-python==5.0.0.93
+pillow==13.0.0
+pycolmap==4.2.1
+python-multipart==0.0.32
+reportlab==5.1.0
+rtree==1.4.1
+scipy==1.17.1
+shapely==2.2.0
+trimesh==5.2.0
+uvicorn==0.54.0

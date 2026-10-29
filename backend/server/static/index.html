@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#0d1117">
+<title>LimbScan</title>
+<style>
+:root{--bg:#0d1117;--card:#161b22;--line:#30363d;--fg:#e6edf3;--mut:#8b949e;--acc:#2f81f7;--ok:#3fb950;--warn:#d29922;--bad:#f85149}
+*{box-sizing:border-box}html,body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+header{display:flex;align-items:center;gap:10px;padding:14px 16px;padding-top:max(14px,env(safe-area-inset-top));border-bottom:1px solid var(--line);position:sticky;top:0;background:var(--bg);z-index:5}
+header b{font-size:18px}header .sp{flex:1}
+main{padding:16px;max-width:900px;margin:0 auto}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px;margin-bottom:14px}
+h2{font-size:17px;margin:0 0 10px}h3{font-size:15px;margin:14px 0 6px;color:var(--mut);font-weight:600}
+button,.btn{appearance:none;border:0;border-radius:12px;padding:13px 16px;font-size:16px;font-weight:600;background:var(--acc);color:#fff;cursor:pointer;display:inline-block;text-decoration:none;text-align:center}
+button.sec,.btn.sec{background:#21262d;color:var(--fg);border:1px solid var(--line)}
+button.bad{background:var(--bad)}button:disabled{opacity:.45}
+.row{display:flex;gap:10px;flex-wrap:wrap}.row>*{flex:1 1 140px}
+.mut{color:var(--mut)}.small{font-size:13px}
+ol{padding-left:20px;margin:6px 0}li{margin:5px 0}
+.list .item{display:flex;justify-content:space-between;align-items:center;padding:12px 0;border-bottom:1px solid var(--line);cursor:pointer}
+.pill{color:var(--fg);text-decoration:none;font-size:12px;padding:3px 8px;border-radius:99px;background:#21262d;border:1px solid var(--line)}
+.pill.ok{color:var(--ok)}.pill.bad{color:var(--bad)}.pill.run{color:var(--warn)}
+.bar{height:8px;background:#21262d;border-radius:9px;overflow:hidden}.bar>i{display:block;height:100%;background:var(--acc);width:0;transition:width .4s}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:10px}
+.stat{background:#0d1117;border:1px solid var(--line);border-radius:12px;padding:10px 12px}
+.stat .v{font-size:22px;font-weight:700}.stat .k{font-size:12px;color:var(--mut)}
+table{width:100%;border-collapse:collapse;font-size:13px}td,th{padding:6px 4px;border-bottom:1px solid var(--line);text-align:right}td:first-child,th:first-child{text-align:left}
+#viewer{width:100%;height:58vh;min-height:320px;max-height:560px;border-radius:12px;background:#0b0f14;touch-action:none}
+canvas#chart{width:100%;height:240px}
+pre{white-space:pre-wrap;font-size:11px;color:var(--mut);max-height:160px;overflow:auto}
+
+button.big{width:100%;padding:17px;font-size:18px;border-radius:14px}
+.hero h2{font-size:20px}
+.wiz h2{font-size:21px;margin:2px 0 12px}.step{font-size:12px;color:var(--acc);font-weight:700;letter-spacing:.04em;text-transform:uppercase}
+.dots{display:flex;gap:6px;margin-bottom:12px}.dots i{flex:1;height:5px;border-radius:5px;background:#21262d}.dots i.on{background:var(--acc)}.dots i.done{background:var(--ok)}
+.skwrap{background:#0d1117;border:1px solid var(--line);border-radius:14px;padding:10px;margin:4px 0 12px}
+.sk{width:100%;height:auto;display:block;max-height:46vh}
+.wiz ol{padding-left:20px}.wiz li{margin:8px 0}
+.chk{display:flex;gap:10px;align-items:center;padding:14px;border:1px solid var(--line);border-radius:12px;margin:14px 0;font-weight:600;background:#0d1117}
+.chk input{width:22px;height:22px;accent-color:var(--ok)}
+.nav{margin-top:6px}.nav button{flex:1}
+.pv{position:relative;border-radius:14px;overflow:hidden;background:#000;aspect-ratio:3/4;max-height:52vh;margin:0 auto 12px}
+.pv video{width:100%;height:100%;object-fit:cover}.pvframe{position:absolute;inset:12%;border:2px dashed rgba(255,255,255,.5);border-radius:12px}
+.checks{display:grid;gap:8px;margin-bottom:12px}.ck{padding:11px 12px;border-radius:10px;background:#0d1117;border:1px solid var(--line);font-weight:600}
+.ck.ok{color:var(--ok);border-color:#23863699}.ck.warn{color:var(--warn)}.ck.bad{color:var(--bad);border-color:#f8514955}
+@keyframes dash{to{stroke-dashoffset:-40}}.flow{stroke-dasharray:10 10;animation:dash 1s linear infinite}
+.poses{display:grid;gap:10px;margin-bottom:12px}
+.pose{display:block;text-align:left;background:#0d1117;border:2px solid var(--line);color:var(--fg);padding:10px;border-radius:14px;font-weight:400}
+.pose .skwrap{margin:0 0 8px;padding:4px}.pose>b{display:block;font-size:17px;margin-bottom:2px}.pose span{font-size:13px;color:var(--mut)}
+.pose.sel{border-color:var(--acc);background:#0f1f38}
+#cap.xr{background:transparent}#cap.xr video{display:none}
+/* capture */
+#cap{position:fixed;inset:0;background:#000;z-index:20;display:none;color:#fff}
+#cap video{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
+#flash{position:absolute;inset:0;background:#fff;opacity:0;pointer-events:none;transition:opacity .12s}
+#top{position:absolute;left:0;right:0;top:0;padding:10px 12px;padding-top:max(10px,env(safe-area-inset-top));background:linear-gradient(rgba(0,0,0,.75),transparent);display:flex;gap:10px;align-items:center}
+#ptitle{font-weight:800;font-size:16px;flex:1}
+#steps{position:absolute;left:12px;right:12px;top:calc(max(10px,env(safe-area-inset-top)) + 40px);display:flex;gap:5px}
+#steps i{flex:1;height:5px;border-radius:5px;background:linear-gradient(90deg,var(--acc) var(--p),rgba(255,255,255,.25) var(--p))}#steps i.done{background:var(--ok)}
+.ib{background:rgba(0,0,0,.45);border:1px solid rgba(255,255,255,.25);color:#fff;padding:8px 11px;border-radius:10px;font-size:16px}
+#side{position:absolute;right:8px;top:30%;display:flex;flex-direction:column;align-items:center;gap:4px}
+#tilt{width:30px;height:120px}
+#ringw{position:absolute;left:12px;top:calc(max(10px,env(safe-area-inset-top)) + 58px);text-align:center}
+#ring{width:96px;height:96px}
+#qual{position:absolute;right:12px;top:calc(max(10px,env(safe-area-inset-top)) + 58px);font-size:12px;line-height:1.9;text-align:right;text-shadow:0 1px 2px #000}
+.q{display:inline-block;width:10px;height:10px;border-radius:50%;margin-left:6px;vertical-align:middle;background:#666}.q.ok{background:var(--ok)}.q.warn{background:var(--warn)}.q.bad{background:var(--bad)}
+#hud{position:absolute;left:0;right:0;bottom:0;padding:12px;padding-bottom:max(12px,env(safe-area-inset-bottom));background:linear-gradient(transparent,rgba(0,0,0,.88) 30%)}
+#hrow{display:flex;gap:12px;align-items:flex-end}
+#mini{width:104px;flex:0 0 104px;background:rgba(13,17,23,.75);border-radius:12px;padding:4px}
+#big{font-size:34px;font-weight:800;line-height:1}#bigl{font-size:11px;opacity:.7}
+#hint{font-size:17px;font-weight:700;margin:8px 0 10px;min-height:24px}#hint.warn{color:#ffb347}#hint.ok{color:#7ee787}
+#intro{position:absolute;inset:0;background:rgba(0,0,0,.72);display:none;align-items:center;justify-content:center;padding:16px;z-index:3}
+.icard{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:18px;max-width:460px;width:100%;color:var(--fg);max-height:92vh;overflow:auto}
+.icard h2{font-size:22px;margin:2px 0 10px}
+</style>
+</head>
+<body>
+<header><b>🦾 LimbScan</b><span class="sp"></span><a class="pill" href="#/">Scans</a></header>
+<main id="app"></main>
+
+<div id="cap">
+  <video id="vid" playsinline muted autoplay></video>
+  <div id="flash"></div>
+  <div id="top"><button class="ib" id="ccancel">✕</button><div id="ptitle"></div><button class="ib" id="voice">🔇</button><button class="ib" id="cpause">⏸</button></div>
+  <div id="steps"></div>
+  <div id="ringw"><canvas id="ring" width="220" height="220"></canvas><div class="small">coverage</div></div>
+  <div id="qual"><div>focus<span class="q" id="qs"></span></div><div>steady<span class="q" id="qm"></span></div><div><span id="tk">markers</span><span class="q" id="qk"></span></div></div>
+  <div id="side"><canvas id="tilt" width="60" height="240"></canvas><div class="small">tilt</div></div>
+  <div id="hud">
+    <div id="hint"></div>
+    <div id="hrow"><div id="mini"></div><div style="flex:1"><div id="big">0</div><div id="bigl">photos</div><div class="bar" style="margin-top:8px"><i id="upbar"></i></div></div></div>
+    <div class="row" style="margin-top:10px"><button class="sec" id="cnext">Next pass ▸</button><button id="cdone">Finish</button></div>
+  </div>
+  <div id="intro"></div>
+</div>
+
+<script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"}}</script>
+<script type="module" src="/static/app.js"></script>
+</body>
+</html>
