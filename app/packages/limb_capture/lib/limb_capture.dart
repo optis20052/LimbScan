@@ -37,7 +37,7 @@ class ArPose {
   bool get isTracking => tracking == 'tracking';
 }
 
-/// Live on-device limb detection (MediaPipe body-skin), in on-screen coordinates (0..1 of the preview).
+/// Live cut-out of the tapped limb (MediaPipe interactive segmenter), in on-screen coordinates (0..1 of the preview).
 class LimbInfo {
   LimbInfo.fromMap(Map m)
       : frac = (m['frac'] as num).toDouble(),
@@ -51,7 +51,16 @@ class LimbInfo {
         gridH = m['gh'] as int,
         mask = m['mask'] as Uint8List,
         vp = m['vp'] == null ? null : _vec(m['vp']),
+        dist = m['dist'] == null ? -1 : (m['dist'] as num).toDouble(),
+        surface = (m['centre'] as List?)?.isNotEmpty == true ? _vec(m['centre']) : null,
         t = m['t'] as int;
+
+  /// The same detection with another confidence grid (e.g. smoothed over time by the app).
+  LimbInfo withMask(Uint8List m) =>
+      LimbInfo._(frac, cx, cy, box, edge, limbLum, bgLum, gridW, gridH, m, vp, dist, surface, t);
+
+  LimbInfo._(this.frac, this.cx, this.cy, this.box, this.edge, this.limbLum, this.bgLum, this.gridW, this.gridH, this.mask,
+      this.vp, this.dist, this.surface, this.t);
 
   /// Share of the camera image that is limb skin.
   final double frac;
@@ -67,10 +76,16 @@ class LimbInfo {
   final Uint8List mask;
   /// World -> clip matrix of the preview at the moment of the analysed camera frame (to warp the mask to now).
   final List<double>? vp;
+  /// Camera -> arm distance in metres from ARCore's tracked points on the arm, or -1 when too few points.
+  final double dist;
+  /// A point on the arm's visible surface (median of ARCore's tracked points on it), world frame, or null.
+  final List<double>? surface;
   final int t;
 
   bool get visible => frac > 0.04 && cx >= 0;
-  bool get backlit => visible && (limbLum < 55 || bgLum > 1.7 * limbLum);
+  /// The arm itself is too dark to photograph. A bright window behind a well-lit arm is fine (the background is cut
+  /// away; walking round the arm always passes the window): only a dark arm against bright light counts.
+  bool get backlit => visible && (limbLum < 55 || (limbLum < 85 && bgLum > 2.0 * limbLum));
   bool get cutOff => visible && edge > 0.25 && frac > 0.35;
   bool get tooSmall => visible && frac < 0.07;
 }
@@ -85,7 +100,8 @@ class CapturedFrame {
         k = _vec(m['K']),
         sharpness = (m['sharpness'] as num).toDouble(),
         t = m['t'] as int,
-        source = m['src'] as String;
+        source = m['src'] as String,
+        seg = m['seg'] == null ? null : Map<String, Object>.from(m['seg'] as Map);
 
   final String path;
   final int width;
@@ -95,9 +111,13 @@ class CapturedFrame {
   final double sharpness;
   final int t;
   final String source; // arcore | arkit
+  /// How the server should cut the limb out of this photo ({mode: auto, seed: [x, y]}: a point on the limb, 0..1 of
+  /// the stored image). Set by the app from the placed arm cylinder; null = server default (skin).
+  Map<String, Object>? seg;
 
   /// JSON sent with the upload (same fields the LimbScan server reads from WebXR captures).
-  Map<String, Object> toMeta() => {'pose': pose, 'K': k, 'w': width, 'h': height, 't': t, 'src': source};
+  Map<String, Object> toMeta() =>
+      {'pose': pose, 'K': k, 'w': width, 'h': height, 't': t, 'src': source, 'seg': ?seg};
 }
 
 List<double> _vec(Object? v) => (v as List).map((e) => (e as num).toDouble()).toList();
@@ -120,6 +140,38 @@ class LimbCapture {
       CapturedFrame.fromMap((await _ch.invokeMethod<Map>('capture', {'dir': dir}))!);
 
   static Future<void> setTorch(bool on) => _ch.invokeMethod('setTorch', {'on': on});
+
+  /// Start following (cutting out) the object at this screen point (0..1 of the view): results on [limbs].
+  static Future<void> pickColour(double u, double v) => _ch.invokeMethod('pickColour', {'u': u, 'v': v});
+
+  /// Look for hands on every frame (results on [hands]) until switched off or an object is tapped ([pickColour]).
+  static Future<void> findHands(bool on) => _ch.invokeMethod('findHands', {'on': on});
+
+  /// Hands seen in the camera (~10 Hz) while [findHands] is on.
+  static Stream<HandsInfo> get hands => _hands ??= _events
+      .where((e) => e is Map && e['type'] == 'hand')
+      .map((e) => HandsInfo.fromMap(e as Map));
+  static Stream<HandsInfo>? _hands;
+
+  /// Stop the live cut-out (no more [limbs] events).
+  static Future<void> clearColour() => _ch.invokeMethod('clearColour');
+
+  /// The 3D point (AR world, metres) on the real surface seen at screen point (u, v) (0..1 of the view), or null
+  /// when nothing was hit (ARCore depth / tracked points / planes).
+  static Future<List<double>?> hitTest(double u, double v) async {
+    final r = await _ch.invokeMethod<List>('hitTest', {'u': u, 'v': v});
+    return r == null ? null : _vec(r);
+  }
+
+  /// Distance (m) from the camera along the viewing ray of each view point (u, v pairs, 0..1) from ARCore's depth
+  /// map: one value per point, 0 where unknown; null when depth is not available.
+  static Future<List<double>?> depth(List<double> uv) async {
+    final r = await _ch.invokeMethod<List>('depth', {'uv': uv});
+    return r?.map((e) => (e as num).toDouble()).toList();
+  }
+
+  /// The app's own recent log lines (Android logcat of this process).
+  static Future<String?> readLog({int lines = 6000}) => _ch.invokeMethod<String>('readLog', {'lines': lines});
 
   /// Crash / error report recorded since the last call (Java + native exits), or null.
   static Future<String?> lastCrash() => _ch.invokeMethod<String>('lastCrash');
@@ -174,4 +226,31 @@ class ArCameraView extends StatelessWidget {
     }
     return const Center(child: Text('AR capture needs Android or iOS'));
   }
+}
+
+
+/// One hand from MediaPipe's hand landmarker: 21 landmarks (wrist 0, thumb 1-4, index 5-8, middle 9-12, ring 13-16,
+/// little 17-20).
+class HandInfo {
+  HandInfo(this.lm, this.world, this.score);
+  /// Landmarks in view coordinates (0..1): u0, v0, u1, v1, ...
+  final List<double> lm;
+  /// The hand's metric 3D shape (metres; camera axes x right, y down, z away; origin at the hand's centre).
+  final List<double> world;
+  final double score;
+}
+
+/// The hands seen in one camera frame, with that frame's view-projection matrix.
+class HandsInfo {
+  HandsInfo(this.hands, this.vp);
+  factory HandsInfo.fromMap(Map m) => HandsInfo([
+        for (final h in (m['hands'] as List? ?? const []))
+          HandInfo(
+            [for (final v in (h as Map)['lm'] as List) (v as num).toDouble()],
+            [for (final v in h['world'] as List) (v as num).toDouble()],
+            (h['score'] as num?)?.toDouble() ?? 0,
+          ),
+      ], [for (final v in (m['vp'] as List? ?? const [])) (v as num).toDouble()]);
+  final List<HandInfo> hands;
+  final List<double> vp;
 }

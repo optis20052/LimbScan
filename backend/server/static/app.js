@@ -1,6 +1,6 @@
 import { $, api, fmt, ui } from './common.js';
 import { S } from './sketches.js';
-import { scanPage, disposeResults } from './results.js';
+import { scanPage, disposeResults } from './results.js?v=4';
 
 const app = $('#app');
 const store = { get: k => { try { return localStorage.getItem(k); } catch (e) { return null; } }, set: (k, v) => { try { localStorage.setItem(k, v); } catch (e) { } } };

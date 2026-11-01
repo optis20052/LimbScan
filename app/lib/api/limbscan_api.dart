@@ -81,9 +81,16 @@ class LimbScanApi {
     }
   }
 
+  /// The phone's log for a scan session (replaces what was sent before for the same [session]).
+  Future<void> sendLog(String session, String text) =>
+      _dio.post('/api/log', data: FormData.fromMap({'session': session, 'text': text}));
+
   Future<void> reportCrash(String text) => _dio.post('/api/crash', data: FormData.fromMap({'text': text}));
 
-  Future<void> start(String scanId) => _dio.post('/api/scans/$scanId/start');
+  /// Process the scan. [arm]: the arm cylinder as finally placed ({a, b, r}, AR world metres): the server cuts every
+  /// photo out with it.
+  Future<void> start(String scanId, {Map<String, Object>? arm}) => _dio.post('/api/scans/$scanId/start',
+      data: arm == null ? null : FormData.fromMap({'arm': jsonEncode(arm)}));
 
   Future<void> delete(String scanId) => _dio.delete('/api/scans/$scanId');
 

@@ -11,8 +11,9 @@ import '../theme.dart';
 /// Live arm highlight over the camera preview.
 ///
 /// The on-device segmentation (a 72x128 confidence grid over the preview) is drawn as a soft fill with a crisp,
-/// sub-cell contour (marching squares) and a light sweep. Segmentation lags the camera by ~100 ms, so the mask
-/// is shifted by how the camera moved since that frame (AR poses), which keeps the glow glued to the arm.
+/// sub-cell contour (marching squares) and a light sweep. The mask is lightly averaged over the last detections (no
+/// flicker) and warped from its camera frame into the current one (perspective transform at the arm's measured
+/// distance), so the outline stays on the arm while the phone moves.
 class LimbOverlay extends StatefulWidget {
   const LimbOverlay({
     super.key,
@@ -21,12 +22,15 @@ class LimbOverlay extends StatefulWidget {
     required this.locked,
     required this.armDistance,
     required this.sweep,
+    this.shade,
   });
   final ValueListenable<LimbInfo?> limb;
   final ValueListenable<ArPose?> pose;
   final ValueListenable<bool> locked;
   final double Function() armDistance; // metres, camera -> arm (best current estimate)
   final Animation<double> sweep;
+  /// Per-pixel colours for the mask (premultiplied RGBA on its grid), e.g. scanned skin in green; null = plain.
+  final Uint8List? Function(LimbInfo l)? shade;
 
   @override
   State<LimbOverlay> createState() => _LimbOverlayState();
@@ -36,7 +40,9 @@ class _LimbOverlayState extends State<LimbOverlay> {
   ui.Image? _mask;
   List<Offset> _contour = const []; // segment endpoints, view-normalized, pairs
   LimbInfo? _shown;
-  List<double>? _anchor; // world point at the arm centre for the shown mask
+  bool _painted = false; // the mask carries its own colours (scan progress)
+  Float32List? _smooth; // confidence grid averaged over the last detections: a calm, steady outline
+  int _smoothAt = 0;
 
   @override
   void initState() {
@@ -51,19 +57,40 @@ class _LimbOverlayState extends State<LimbOverlay> {
     super.dispose();
   }
 
+  /// Each new detection counts half, the previous average the other half: the outline glides instead of jumping
+  /// (the detector's edge flickers by a few pixels from frame to frame).
+  Uint8List _temporal(LimbInfo l) {
+    final n = l.mask.length;
+    final now = DateTime.now().millisecondsSinceEpoch;
+    final prev = _smooth;
+    final fresh = prev == null || prev.length != n || now - _smoothAt > 500;
+    final acc = fresh ? Float32List(n) : prev;
+    for (var i = 0; i < n; i++) {
+      acc[i] = fresh ? l.mask[i].toDouble() : 0.35 * acc[i] + 0.65 * l.mask[i];
+    }
+    _smooth = acc;
+    _smoothAt = now;
+    final out = Uint8List(n);
+    for (var i = 0; i < n; i++) {
+      out[i] = acc[i].round().clamp(0, 255);
+    }
+    return out;
+  }
+
   void _onLimb() {
-    final l = widget.limb.value;
-    if (l == null || identical(l, _shown)) return;
+    final l0 = widget.limb.value;
+    if (l0 == null || identical(l0, _shown)) return;
+    final l = l0.withMask(_temporal(l0));
     final contour = marchingSquares(l.mask, l.gridW, l.gridH, 128);
-    final px = _alphaPixels(l.mask);
-    final anchor = (l.vp != null && l.visible) ? unproject(l.vp!, l.cx, l.cy, widget.armDistance()) : null;
+    final shaded = l.visible ? widget.shade?.call(l) : null;
+    final px = shaded ?? _alphaPixels(l.mask);
     ui.decodeImageFromPixels(px, l.gridW, l.gridH, ui.PixelFormat.rgba8888, (img) {
       if (!mounted) return img.dispose();
       _mask?.dispose();
       _mask = img;
       _shown = l;
       _contour = contour;
-      _anchor = anchor;
+      _painted = shaded != null;
       setState(() {});
     });
   }
@@ -88,6 +115,34 @@ Uint8List _alphaPixels(Uint8List mask) {
     out[4 * i + 3] = a;
   }
   return out;
+}
+
+/// 3x3 homography (row-major, h[8] = 1) mapping 4 points [src] onto [dst], or null if degenerate.
+List<double>? homography(List<Offset> src, List<Offset> dst) {
+  final a = List.generate(8, (_) => List.filled(9, 0.0));
+  for (var i = 0; i < 4; i++) {
+    final x = src[i].dx, y = src[i].dy, X = dst[i].dx, Y = dst[i].dy;
+    a[2 * i] = [x, y, 1, 0, 0, 0, -x * X, -y * X, X];
+    a[2 * i + 1] = [0, 0, 0, x, y, 1, -x * Y, -y * Y, Y];
+  }
+  for (var c = 0; c < 8; c++) {
+    var piv = c;
+    for (var r = c + 1; r < 8; r++) {
+      if (a[r][c].abs() > a[piv][c].abs()) piv = r;
+    }
+    if (a[piv][c].abs() < 1e-9) return null;
+    final t = a[c];
+    a[c] = a[piv];
+    a[piv] = t;
+    for (var r = 0; r < 8; r++) {
+      if (r == c) continue;
+      final f = a[r][c] / a[c][c];
+      for (var k = c; k < 9; k++) {
+        a[r][k] -= f * a[c][k];
+      }
+    }
+  }
+  return [for (var r = 0; r < 8; r++) a[r][8] / a[r][r], 1.0];
 }
 
 /// Iso-contour of a grid at [level] as line segments (pairs of points), in 0..1 coordinates of the grid area.
@@ -147,7 +202,6 @@ List<Offset> marchingSquares(Uint8List g, int w, int h, int level) {
   return out;
 }
 
-const debugShift = false;
 
 class _OverlayPainter extends CustomPainter {
   _OverlayPainter(this.s, Listenable repaint) : super(repaint: repaint);
@@ -163,30 +217,22 @@ class _OverlayPainter extends CustomPainter {
       _reticle(canvas, size, s.widget.sweep.value);
       return;
     }
-    // follow the camera: where the arm centre of that (older) mask appears now
-    var shift = Offset.zero;
-    final a = s._anchor;
-    if (a != null && pose?.vp != null && pose!.isTracking) {
-      final now = project(pose.vp!, a, size);
-      if (now != null) {
-        shift = now - Offset(l.cx * size.width, l.cy * size.height);
-        if (shift.distance > size.shortestSide * 0.3) shift = Offset.zero; // implausible: don't jump
-      }
-      if (debugShift && DateTime.now().millisecondsSinceEpoch % 1000 < 40) {
-        // ignore: avoid_print
-        print('LIMBDBG shift=${shift.dx.toStringAsFixed(1)},${shift.dy.toStringAsFixed(1)} c=${l.cx.toStringAsFixed(3)},${l.cy.toStringAsFixed(3)} track=${pose.isTracking}');
-      }
-    }
+    // the outline comes from a slightly older camera frame: map it into the current view (perspective warp for the
+    // arm's measured distance), so it stays on the arm while the phone moves
     canvas.save();
-    canvas.translate(shift.dx, shift.dy);
+    if (pose != null && pose.isTracking && pose.vp != null && l.vp != null) {
+      final w = _motionWarp(l, pose.vp!, size, l.dist > 0 ? l.dist : s.widget.armDistance());
+      if (w != null) canvas.transform(w.storage);
+    }
     final rect = Offset.zero & size;
-    final colour = locked ? C.teal : C.primary;
+    final painted = s._painted;
+    final colour = painted ? Colors.white : (locked ? const Color(0xFF3DDC84) : Colors.white);
     final m = s._mask;
     if (m != null) {
       final src = Rect.fromLTWH(0, 0, m.width.toDouble(), m.height.toDouble());
       // soft fill: smooth upsampled confidence, thresholded to a clean edge by a colour matrix
-      canvas.saveLayer(rect, Paint()..color = const Color.fromRGBO(0, 0, 0, 0.24)); // fill opacity
-      canvas.saveLayer(rect, Paint()..colorFilter = _threshold(colour));
+      canvas.saveLayer(rect, Paint()..color = Color.fromRGBO(0, 0, 0, painted ? 0.42 : 0.14)); // fill opacity
+      canvas.saveLayer(rect, Paint()..colorFilter = painted ? _thresholdAlpha() : _threshold(colour));
       canvas.drawImageRect(m, src, rect, Paint()..filterQuality = FilterQuality.low);
       canvas.restore();
       canvas.restore();
@@ -227,7 +273,7 @@ class _OverlayPainter extends CustomPainter {
         Paint()
           ..style = PaintingStyle.stroke
           ..strokeWidth = 9
-          ..color = colour.withValues(alpha: 0.35)
+          ..color = colour.withValues(alpha: painted ? 0.25 : 0.35)
           ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 6),
       );
       canvas.drawPath(
@@ -242,6 +288,26 @@ class _OverlayPainter extends CustomPainter {
     canvas.restore();
   }
 
+  /// Homography taking screen positions in the mask's frame to the current frame, for points at [dist] metres
+  /// (fitted through the four corners of the arm's box); null when the motion is implausible.
+  Matrix4? _motionWarp(LimbInfo l, List<double> vpNow, Size size, double dist) {
+    final b = l.box;
+    final src = <Offset>[], dst = <Offset>[];
+    for (final (u, v) in [(b[0], b[1]), (b[2], b[1]), (b[2], b[3]), (b[0], b[3])]) {
+      final world = unproject(l.vp!, u, v, dist);
+      final q = world == null ? null : project(vpNow, world, size);
+      if (q == null) return null;
+      final p = Offset(u * size.width, v * size.height);
+      if ((q - p).distance > size.shortestSide * 0.6) return null;
+      src.add(p);
+      dst.add(q);
+    }
+    if ((src[1] - src[0]).distance < 4 || (src[3] - src[0]).distance < 4) return null;
+    final h = homography(src, dst);
+    if (h == null) return null;
+    return Matrix4(h[0], h[3], 0, h[6], h[1], h[4], 0, h[7], 0, 0, 1, 0, h[2], h[5], 0, 1);
+  }
+
   /// Constant colour, alpha' = k * (alpha - 0.5) + 0.5 (clamped by the layer): a smooth but clean edge.
   ColorFilter _threshold(Color c) {
     const k = 7.0;
@@ -249,6 +315,17 @@ class _OverlayPainter extends CustomPainter {
       0, 0, 0, 0, c.r * 255, //
       0, 0, 0, 0, c.g * 255,
       0, 0, 0, 0, c.b * 255,
+      0, 0, 0, k, (0.5 - 0.5 * k) * 255,
+    ]);
+  }
+
+  /// Same clean edge, keeping the per-pixel colours.
+  ColorFilter _thresholdAlpha() {
+    const k = 7.0;
+    return const ColorFilter.matrix([
+      1, 0, 0, 0, 0, //
+      0, 1, 0, 0, 0,
+      0, 0, 1, 0, 0,
       0, 0, 0, k, (0.5 - 0.5 * k) * 255,
     ]);
   }

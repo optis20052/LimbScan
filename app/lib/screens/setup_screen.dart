@@ -102,7 +102,8 @@ class _SetupScreenState extends State<SetupScreen> {
           selected: _pose == 'upright',
           scene: Scene.upright,
           title: 'Upright',
-          text: 'Elbow on the table (a folded towel helps), forearm up, fingers relaxed and slightly apart.',
+          text: 'Elbow RESTING on a table, forearm up, fingers spread wide apart. Never held up in the air: '
+              'a hand without support moves a little and the scan comes out wrong.',
           onTap: () => setState(() => _pose = 'upright'),
         ),
         const SizedBox(height: 12),
@@ -120,16 +121,20 @@ class _SetupScreenState extends State<SetupScreen> {
         const Card(child: Padding(padding: EdgeInsets.all(12), child: Illustration(Scene.light, height: 200))),
         const SizedBox(height: 14),
         const _Tip(Icons.checkroom_rounded, 'Bare skin', 'Sleeve above the elbow; remove watch and rings if allowed.'),
-        const _Tip(Icons.flashlight_on_rounded, 'Dim room?', 'Use the torch button on the scan screen.'),
+        const _Tip(Icons.flashlight_on_rounded, 'Torch on', 'The phone\'s light is on during the scan: even light that moves with the phone. Switch it off on the scan screen before the first photo if it glares.'),
       ]);
 
   Widget _stillStep(TextTheme t) => _step(t, 'HOW IT WORKS', 'Only the phone moves',
-          'Keep the arm and fingers completely still. Circle the phone slowly around the arm, 30–40 cm away.', [
+          'The arm and fingers stay completely still. You walk once around the hand, from one side of the patient to '
+          'the other, with the whole hand on screen.', [
         const Card(child: Padding(padding: EdgeInsets.all(12), child: Illustration(Scene.still, height: 170))),
         const SizedBox(height: 14),
-        const _Tip(Icons.auto_awesome_rounded, 'Photos are automatic',
-            'The app finds the arm on screen and only takes sharp, new views of it.'),
-        const _Tip(Icons.loop_rounded, 'Two slow circles', 'The screen and voice tell you where to go next.'),
+        const _Tip(Icons.back_hand_rounded, '1. Point at the hand', 'The app finds the hand by itself.'),
+        const _Tip(Icons.swap_vert_rounded, '2. Toward the hand and back',
+            'Move the phone slowly toward the hand and back until the bar is full: this sets the size of the scan.'),
+        const _Tip(Icons.radio_button_checked_rounded, '3. Walk from dot to dot',
+            'Photos are automatic. A dot turns green when it has good photos; if one stays amber, the app sends you '
+            'back to it. It finishes by itself when all dots are green.'),
         const _Tip(Icons.straighten_rounded, 'No card or markers', 'The phone measures its own movement in millimetres.'),
       ]);
 }

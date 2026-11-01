@@ -65,7 +65,47 @@ class LimbCapturePlugin : FlutterPlugin, MethodChannel.MethodCallHandler, Activi
                 val view = views.active ?: return result.error("no_view", "AR view not running", null)
                 view.requestCapture(dir, result)
             }
+            "hitTest" -> {
+                val view = views.active ?: return result.success(null)
+                view.requestHit((call.argument<Double>("u") ?: 0.5).toFloat(), (call.argument<Double>("v") ?: 0.5).toFloat(), result)
+            }
+            "depth" -> {
+                val view = views.active ?: return result.success(null)
+                val uv = (call.argument<List<Double>>("uv") ?: emptyList()).map { it.toFloat() }.toFloatArray()
+                view.requestDepth(uv, result)
+            }
+            "readLog" -> {
+                // this app's own log (an app may read its own lines): sent to the server with each scan, so a test
+                // needs no USB cable
+                val lines = call.argument<Int>("lines") ?: 6000
+                Thread {
+                    val text = try {
+                        // the whole buffer of this process, minus system chatter that would push our lines out
+                        // (ARCore's depth module can log ~10 errors a second)
+                        val noise = listOf("spherical_rectifier", "AF_DEBUG", "gralloc", "SV[", "VRI[", "BLASTBuffer",
+                            "InsetsController", "InputMethod", "ViewRootImpl", "SurfaceView", "BufferQueue")
+                        val p = ProcessBuilder("logcat", "-d", "-v", "time", "--pid=${android.os.Process.myPid()}")
+                            .redirectErrorStream(true).start()
+                        val kept = p.inputStream.bufferedReader().lineSequence().filter { l -> noise.none { l.contains(it) } }.toList()
+                        p.waitFor()
+                        kept.takeLast(lines).joinToString("\n")
+                    } catch (e: Exception) { "log unavailable: ${e.message}" }
+                    android.os.Handler(android.os.Looper.getMainLooper()).post { result.success(text) }
+                }.start()
+            }
             "lastCrash" -> result.success(activity?.let { CrashLog.collect(it) })
+            "pickColour" -> {
+                views.active?.pickColour((call.argument<Double>("u") ?: 0.5).toFloat(), (call.argument<Double>("v") ?: 0.5).toFloat())
+                result.success(null)
+            }
+            "findHands" -> {
+                views.active?.findHands(call.argument<Boolean>("on") ?: true)
+                result.success(null)
+            }
+            "clearColour" -> {
+                views.active?.clearColour()
+                result.success(null)
+            }
             "setTorch" -> {
                 views.active?.setTorch(call.argument<Boolean>("on") ?: false)
                 result.success(null)

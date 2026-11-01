@@ -61,4 +61,16 @@ void main() {
     final xs = seg.map((p) => p.dx);
     expect(xs.reduce((a, b) => a < b ? a : b), closeTo(0.3, 0.02));
   });
+
+  test('homography maps the four points exactly', () {
+    final src = [const Offset(10, 10), const Offset(200, 20), const Offset(210, 300), const Offset(0, 280)];
+    final dst = [const Offset(30, 5), const Offset(230, 40), const Offset(220, 330), const Offset(15, 290)];
+    final h = homography(src, dst)!;
+    for (var i = 0; i < 4; i++) {
+      final x = src[i].dx, y = src[i].dy;
+      final w = h[6] * x + h[7] * y + h[8];
+      expect((h[0] * x + h[1] * y + h[2]) / w, closeTo(dst[i].dx, 1e-6));
+      expect((h[3] * x + h[4] * y + h[5]) / w, closeTo(dst[i].dy, 1e-6));
+    }
+  });
 }

@@ -105,7 +105,7 @@ class _HomeScreenState extends State<HomeScreen> {
             const SizedBox(height: 10),
             if (_online == false)
               _infoCard(Icons.cloud_off_rounded, 'Server not reachable',
-                  '${widget.config.serverUrl}\nThe phone must be on the same Wi-Fi as the scan PC.', C.amber),
+                  '${widget.config.serverUrl}\nThe scan computer must be on and connected to the internet.', C.amber),
             if (_scans == null && _online != false)
               const Padding(padding: EdgeInsets.all(32), child: Center(child: CircularProgressIndicator())),
             if (_scans != null && scans.isEmpty)

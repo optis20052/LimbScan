@@ -109,6 +109,7 @@ def _march(mesh, p0, t0, step, max_steps=200, max_turn_deg=55, follow_bends=Fals
     pts, tans, girths = [], [], []
     t0 = t0 / np.linalg.norm(t0)
     p, t, prev = p0.copy(), t0.copy(), None
+    skipped = 0
     for _ in range(max_steps):
         s = section_at(mesh, p, t, near=p)
         if s is None:
@@ -118,7 +119,15 @@ def _march(mesh, p0, t0, step, max_steps=200, max_turn_deg=55, follow_bends=Fals
             break  # abrupt jump between two 5 mm steps: elbow/shoulder debris or the body (the hand widens gradually)
         c = s['centroid']
         if prev is not None and np.dot(c - prev, t if follow_bends else t0) < 0.3 * step:
+            off = (c - prev) - np.dot(c - prev, t) * t
+            if skipped < 2 and np.linalg.norm(off) > 3 * step:
+                # the centre jumped sideways: a stray loop of an open scan surface took over this section. Step on
+                # along the limb and look again (real debris keeps failing and still ends the march)
+                skipped += 1
+                p = p + t * step
+                continue
             break  # not advancing along the limb any more (looping in debris)
+        skipped = 0
         if np.dot(t, t0) < np.cos(np.deg2rad(max_turn_deg)):
             break  # limb bends away (elbow): stop, the segment of interest ends here
         if prev is not None:
@@ -140,13 +149,17 @@ def centreline(mesh, step=5.0):
     ax = vt[0]
     t = (v - c) @ ax
     # start at the median-girth single-loop section near the middle of the long axis
-    best = None
+    best, open_best = None, None
     for f in np.linspace(-0.25, 0.25, 11):
         p = c + ax * (np.median(t) + f * (t.max() - t.min()))
         s = section_at(mesh, p, ax, near=p)
-        if s is not None and s['n_loops'] == 1:
-            if best is None or abs(f) < abs(best[0]):
-                best = (f, s['centroid'])
+        if s is None:
+            continue
+        if s['n_loops'] == 1 and (best is None or abs(f) < abs(best[0])):
+            best = (f, s['centroid'])
+        if s['seen'] >= 0.85 and (open_best is None or abs(f) < abs(open_best[0])):
+            open_best = (f, s['centroid'])
+    best = best or open_best  # an open scan surface has no closed loops: a well-seen section will do
     p0 = best[1] if best else c
     a_pts, a_t = _march(mesh, p0, ax, step)
     b_pts, b_t = _march(mesh, p0 - ax * step, -ax, step)
@@ -167,9 +180,62 @@ def centreline(mesh, step=5.0):
     return out, tg
 
 
-def measure(mesh, step=5.0):
-    """Girth profile along the limb from the distal tip. Distal end = narrower/branching (hand) end."""
-    pts, tang = centreline(mesh, step=step)
+def axis_line(mesh, wrist, u, step=5.0):
+    """Centreline along a known arm axis (through the wrist, u pointing up the forearm), from the fingertips to the
+    end of the mesh: each point re-centred sideways on its cross-section, kept at its place along the axis. No
+    tracking, so fingers, a thumb or a cut end cannot send it astray."""
+    wrist = np.asarray(wrist, float); u = np.asarray(u, float) / np.linalg.norm(u)
+    t = (mesh.vertices - wrist) @ u
+    pts = []
+    for s in np.arange(t.min() + 3.0, t.max() - 3.0, step):
+        p = wrist + u * s
+        sec = section_at(mesh, p, u, near=p)
+        if sec is None:
+            continue
+        c = sec['centroid']
+        pts.append(p + (c - p) - u * ((c - p) @ u))
+    pts = np.array(pts).reshape(-1, 3)
+    if len(pts) < 5:
+        return pts, np.tile(u, (len(pts), 1))
+    k = 3  # light smoothing of the sideways re-centring
+    sm = np.array([pts[max(0, i - k):i + k + 1].mean(0) for i in range(len(pts))])
+    # the limb bends (wrist, a resting forearm): cut each section square to the local direction of the centre line,
+    # not to the hand's axis (a slanted cut reads a bigger girth), and re-centre once more on those sections
+    for _ in range(2):
+        tg = _local_dir(sm, u)
+        new = []
+        for p, n in zip(sm, tg):
+            sec = section_at(mesh, p, n, near=p)
+            new.append(p if sec is None else sec['centroid'])
+        new = np.array(new)
+        sm = np.array([new[max(0, i - k):i + k + 1].mean(0) for i in range(len(new))])
+    return sm, _local_dir(sm, u)
+
+
+def _local_dir(pts, u, half=8, max_deg=35.0):
+    """The centre line's direction at each point over +-half steps (+-40 mm), at most max_deg from the arm axis u
+    (a thumb or a ragged cut end must not turn the sections sideways)."""
+    out = np.empty_like(pts)
+    cmax = np.cos(np.deg2rad(max_deg))
+    for i in range(len(pts)):
+        a, b = pts[max(0, i - half)], pts[min(len(pts) - 1, i + half)]
+        d = b - a
+        n = np.linalg.norm(d)
+        d = u if n < 1e-6 else d / n
+        if d @ u < 0:
+            d = -d
+        if d @ u < cmax:  # too far from the axis: tilt it back to max_deg
+            perp = d - u * (d @ u)
+            perp /= np.linalg.norm(perp) + 1e-12
+            d = u * cmax + perp * np.sqrt(1 - cmax * cmax)
+        out[i] = d
+    return out
+
+
+def measure(mesh, step=5.0, tip=None, axis=None):
+    """Girth profile along the limb from the distal tip. Distal end = the end nearest `tip` (the fingertips, mesh
+    frame) when known, else the narrower/branching (hand) end."""
+    pts, tang = axis_line(mesh, *axis, step=step) if axis is not None else centreline(mesh, step=step)
     rows = []
     for p, n in zip(pts, tang):
         s = section_at(mesh, p, n, near=p)
@@ -185,7 +251,12 @@ def measure(mesh, step=5.0):
         return float(np.sqrt(ev[1] / max(ev[0], 1e-9)))
     asp = np.array([flat(r) for r in rows])
     q = max(len(rows) // 4, 1)
-    if np.median(asp[-q:]) > np.median(asp[:q]):
+    if tip is not None:
+        tip = np.asarray(tip, float)
+        flip = np.linalg.norm(pts[-1] - tip) < np.linalg.norm(pts[0] - tip)
+    else:  # a cut forearm end can look like a hand (rounded off, narrow): only a guess
+        flip = np.median(asp[-q:]) > np.median(asp[:q])
+    if flip:
         pts, tang, rows, loops, area = pts[::-1], -tang[::-1], rows[::-1], loops[::-1], area[::-1]
     arc = np.r_[0, np.cumsum(np.linalg.norm(np.diff(pts, axis=0), axis=1))]
     girth_raw = np.array([r['girth'] for r in rows])
@@ -230,11 +301,14 @@ def measure(mesh, step=5.0):
                 lm[f'wrist_plus_{dd}'] = {'s_mm': sw + dd, 'girth_mm': g_at(sw + dd), 'from_wrist_mm': dd}
         # hand girth (MCP / knuckles, incl. thumb) = the FIRST peak walking from the wrist toward the fingers:
         # further on, the tape-measure hull can span spread fingers and read far more than the hand
+        # The hand is one piece up to where the thumb or the fingers come apart; past that the tape spans spread
+        # fingers and the girth keeps rising (31 Oct printed hand: 265 mm in the middle of the fingers, 54 mm from the
+        # tips, against ~243 mm at the knuckles). So: the largest girth while the section is still one piece.
         j, best = None, 0.0
         for k in range(i - 1, -1, -1):
             if arc[i] - arc[k] < 15:
                 continue
-            if arc[i] - arc[k] > 120:
+            if arc[i] - arc[k] > 120 or (loops[k] > 1 and j is not None):
                 break
             if girth[k] > best:
                 j, best = k, girth[k]

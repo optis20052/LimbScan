@@ -30,7 +30,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
             keyboardType: TextInputType.url,
             decoration: const InputDecoration(
                 labelText: 'Server address',
-                helperText: 'LimbScan server, e.g. http://192.168.50.223:8080 or the https tunnel link'),
+                helperText: 'LimbScan server, normally https://limbscan.yori.to'),
           ),
           const SizedBox(height: 12),
           Row(children: [

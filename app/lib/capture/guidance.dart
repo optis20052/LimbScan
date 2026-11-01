@@ -84,14 +84,14 @@ class Pass {
 
 const uprightPasses = [
   Pass('Around the hand & wrist',
-      'Phone at hand height, 30–40 cm away. Go slowly all the way around the hand and wrist.', -40, 30, 24, 0.7),
+      'Phone at hand height, 30–40 cm away. Go slowly around the hand and wrist until it is all green.', -40, 30, 24, 0.7),
   Pass('Around the forearm',
-      'Lower the phone to the forearm, tilt slightly down, and circle once more down to the elbow.', -60, 10, 20, 0.6),
+      'Lower the phone to the forearm, tilt slightly down, and circle again until the arm is all green.', -60, 10, 20, 0.6),
 ];
 
 const restingPasses = [
-  Pass('From above', 'Phone 30–50 cm above the arm, looking down. Move all the way around it.', -90, -30, 26, 0.6),
-  Pass('From the sides, lower', 'Lower the phone to table height and look at the sides of the arm.', -50, 15, 22, 0.5),
+  Pass('From above', 'Phone 30–50 cm above the arm, looking down. Move around it until it is all green.', -90, -30, 26, 0.6),
+  Pass('From the sides, lower', 'Lower the phone to table height and paint the sides of the arm green.', -50, 15, 22, 0.5),
 ];
 
 /// Coverage bookkeeping for one capture session.
@@ -103,19 +103,31 @@ class Coverage {
   final List<Shot> shots = [];
   final Map<int, int> _photosAtLastNewSide = {};
   Vec3? centre;
+  bool _measured = false; // centre measured on the arm (AR points), not estimated from the photos' viewing rays
 
   int photos(int pass) => shots.where((s) => s.pass == pass).length;
 
+  bool get _ready => centre != null && (_measured || shots.length >= 6);
+
   void add(Shot s) {
     shots.add(s);
-    if (shots.length >= 4) centre = rayCentre(shots) ?? centre;
+    if (!_measured && shots.length >= 4) centre = rayCentre(shots) ?? centre;
     _recount(s.pass);
+  }
+
+  /// Arm centre measured in 3D (from the tracked points on the arm): sides count from the very first photo.
+  void setCentre(Vec3 c) {
+    centre = c;
+    _measured = true;
+    for (var p = 0; p < passes.length; p++) {
+      _recount(p);
+    }
   }
 
   /// Recount sides with the current (improving) arm-centre estimate.
   void _recount(int pass) {
     final c = centre;
-    if (c == null || shots.length < 6) return;
+    if (!_ready || c == null) return;
     final before = bins[pass].where((v) => v > 0).length;
     final b = List.filled(24, 0);
     for (final s in shots.where((s) => s.pass == pass)) {
@@ -133,7 +145,7 @@ class Coverage {
   double progress(int pass) {
     final p = passes[pass];
     final n = photos(pass);
-    if (centre == null || shots.length < 6) return math.min(0.15, n / p.minPhotos);
+    if (!_ready) return math.min(0.15, n / p.minPhotos);
     final cov = covered(pass);
     if (n >= p.minPhotos && cov >= fullCircle) return 1;
     if (n >= p.minPhotos && cov >= p.coverage && n - (_photosAtLastNewSide[pass] ?? 0) >= 10) return 1;

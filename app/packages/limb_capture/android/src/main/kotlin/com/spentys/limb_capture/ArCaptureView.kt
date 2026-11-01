@@ -42,7 +42,7 @@ class ArViewFactory(private val registry: ArViewRegistry, private val activity: 
  * ARCore is configured the way a photogrammetry capture needs it:
  *  - the back camera config with the LARGEST CPU image (the photo we keep),
  *  - continuous AUTO focus (the browser/WebXR path was fixed-focus = soft photos),
- *  - no plane finding / depth / light estimation (saves CPU, not needed).
+ *  - no plane finding / light estimation (saves CPU, not needed); depth only to hit-test the tap on the arm.
  * Each capture returns a JPEG plus the camera pose (camera->world, metres) and the exact intrinsics of the
  * stored image, so the server gets metric scale with no reference object.
  */
@@ -57,6 +57,8 @@ class ArCaptureView(private val activity: Activity, private val registry: ArView
     private var viewH = 0
     private var lastPoseEvent = 0L
     private var pendingCapture: Pair<String, MethodChannel.Result>? = null
+    private var pendingHit: Pair<FloatArray, MethodChannel.Result>? = null
+    private var pendingDepth: Pair<FloatArray, MethodChannel.Result>? = null
     private val encoder = Executors.newSingleThreadExecutor()
     private val inFlight = AtomicInteger(0)
     private var torch = false
@@ -111,11 +113,13 @@ class ArCaptureView(private val activity: Activity, private val registry: ArView
                 updateMode = Config.UpdateMode.LATEST_CAMERA_IMAGE
                 planeFindingMode = Config.PlaneFindingMode.DISABLED
                 lightEstimationMode = Config.LightEstimationMode.DISABLED
-                depthMode = Config.DepthMode.DISABLED
+                // depth (where supported) makes the tap on the arm hit its real surface even with few tracked points
+                depthMode = if (s.isDepthModeSupported(Config.DepthMode.AUTOMATIC)) Config.DepthMode.AUTOMATIC
+                            else Config.DepthMode.DISABLED
             }
             s.configure(cfg)
             session = s
-            Log.i(TAG, "ARCore session: CPU image ${cpuImageSize[0]}x${cpuImageSize[1]}, focus AUTO")
+            Log.i(TAG, "ARCore session: CPU image ${cpuImageSize[0]}x${cpuImageSize[1]}, focus AUTO, depth ${cfg.depthMode}")
         } catch (e: Throwable) {
             Log.e(TAG, "ARCore session failed", e)
             CrashLog.note(activity, "createSession", e)
@@ -131,6 +135,11 @@ class ArCaptureView(private val activity: Activity, private val registry: ArView
     }
 
     private fun pause() { glView.onPause(); session?.pause() }
+
+    /** Test-model mode: follow the object at this view point (0..1) by its colour; null = back to human skin. */
+    fun pickColour(u: Float, v: Float) = limb.pick(u, v)
+    fun clearColour() = limb.clearColour()
+    fun findHands(on: Boolean) { limb.handsOn = on }
 
     fun setTorch(on: Boolean) {
         torch = on
@@ -148,6 +157,55 @@ class ArCaptureView(private val activity: Activity, private val registry: ArView
             if (pendingCapture != null) { result.error("busy", "capture pending", null); return }
             pendingCapture = dir to result
         }
+    }
+
+    /** The 3D point on the surface seen at view point (u, v) (0..1), on the next frame: [x, y, z] or null. */
+    fun requestHit(u: Float, v: Float, result: MethodChannel.Result) {
+        synchronized(this) {
+            pendingHit?.second?.let { r -> main.post { r.success(null) } }
+            pendingHit = floatArrayOf(u, v) to result
+        }
+    }
+
+    /** Distance (m) from the camera along the viewing ray of each view point (u, v pairs, 0..1) from ARCore's depth
+     *  image on the next frame: one value per point, 0 where there is no depth; null when depth is not available. */
+    fun requestDepth(uv: FloatArray, result: MethodChannel.Result) {
+        synchronized(this) {
+            pendingDepth?.second?.let { r -> main.post { r.success(null) } }
+            pendingDepth = uv to result
+        }
+    }
+
+    private fun sampleDepth(frame: com.google.ar.core.Frame, uv: FloatArray): List<Double>? {
+        val img = try { frame.acquireDepthImage16Bits() } catch (e: Exception) { return null }
+        try {
+            val camera = frame.camera
+            val proj = FloatArray(16)
+            camera.getProjectionMatrix(proj, 0, 0.03f, 20f)
+            val rel = camera.pose.inverse().compose(camera.displayOrientedPose)  // display camera -> sensor camera
+            // the depth image covers the CPU image's field of view: map rays with the CPU image intrinsics
+            val intr = camera.imageIntrinsics
+            val f = intr.focalLength; val c = intr.principalPoint; val dims = intr.imageDimensions
+            val plane = img.planes[0]
+            val buf = plane.buffer.order(java.nio.ByteOrder.nativeOrder())
+            val dw = img.width; val dh = img.height
+            val d = FloatArray(3); val r = FloatArray(3)
+            val out = ArrayList<Double>(uv.size / 2)
+            for (k in 0 until uv.size / 2) {
+                val ndcX = 2f * uv[2 * k] - 1f; val ndcY = 1f - 2f * uv[2 * k + 1]
+                d[0] = (ndcX + proj[8]) / proj[0]; d[1] = (ndcY + proj[9]) / proj[5]; d[2] = -1f
+                rel.rotateVector(d, 0, r, 0)
+                val z = -r[2]
+                val iu = (f[0] * r[0] / z + c[0]) / dims[0]; val iv = (f[1] * -r[1] / z + c[1]) / dims[1]
+                val x = (iu * dw).toInt(); val y = (iv * dh).toInt()
+                if (z <= 1e-6f || x < 0 || y < 0 || x >= dw || y >= dh) { out.add(0.0); continue }
+                val mm = buf.getShort(y * plane.rowStride + x * plane.pixelStride).toInt() and 0xffff
+                // depth is along the optical axis: the distance along this ray is depth * |r| / z
+                val n = Math.sqrt((r[0] * r[0] + r[1] * r[1] + r[2] * r[2]).toDouble())
+                out.add(if (mm == 0) 0.0 else mm / 1000.0 * n / z)
+            }
+            return out
+        } finally { img.close() }
     }
 
     override fun getView(): View = glView
@@ -173,6 +231,7 @@ class ArCaptureView(private val activity: Activity, private val registry: ArView
 
     override fun onSurfaceChanged(gl: GL10?, width: Int, height: Int) {
         viewW = width; viewH = height
+        Log.d(TAG, "AR view surface ${width}x${height}")
         GLES20.glViewport(0, 0, width, height)
         @Suppress("DEPRECATION")
         val rotation = activity.windowManager.defaultDisplay.rotation
@@ -217,6 +276,21 @@ class ArCaptureView(private val activity: Activity, private val registry: ArView
             lastLimbRequest = now
             requestLimb(frame, vp)
         }
+        synchronized(this) { val h = pendingHit; pendingHit = null; h }?.let { (uv, result) ->
+            val hit = if (tracking != TrackingState.TRACKING) null else try {
+                // the nearest hit on the depth map only: sparse feature points near the ray can sit on the wall behind
+                frame.hitTest(uv[0] * viewW, uv[1] * viewH).firstOrNull { it.trackable is com.google.ar.core.DepthPoint }
+            } catch (e: Exception) { null }
+            val p = hit?.hitPose
+            Log.d(TAG, "hit test ${uv.joinToString()} -> ${hit?.trackable?.javaClass?.simpleName} d=${hit?.distance}")
+            main.post { result.success(p?.let { listOf(it.tx().toDouble(), it.ty().toDouble(), it.tz().toDouble()) }) }
+        }
+        synchronized(this) { val d = pendingDepth; pendingDepth = null; d }?.let { (uv, result) ->
+            val out = if (tracking != TrackingState.TRACKING) null else sampleDepth(frame, uv)
+            val ok = out?.filter { it > 0 }?.sorted()
+            Log.d(TAG, "depth ${uv.size / 2} points -> ${ok?.size ?: "n/a"} valid, median ${ok?.getOrNull(ok.size / 2)}")
+            main.post { result.success(out) }
+        }
         val req = synchronized(this) { val r = pendingCapture; pendingCapture = null; r } ?: return
         val (dir, result) = req
         if (tracking != TrackingState.TRACKING) { main.post { result.error("not_tracking", "AR tracking not ready", null) }; return }
@@ -227,6 +301,7 @@ class ArCaptureView(private val activity: Activity, private val registry: ArView
         val pose = FloatArray(16).also { camera.pose.toMatrix(it, 0) }  // camera->world, column-major, metres
         val intr = camera.imageIntrinsics
         val f = intr.focalLength; val c = intr.principalPoint; val dims = intr.imageDimensions
+        val seg = limb.colourInfo()
         val raw = FrameEncoder.copyYuv(image)
         image.close()
         inFlight.incrementAndGet()
@@ -241,6 +316,7 @@ class ArCaptureView(private val activity: Activity, private val registry: ArView
                     "pose" to pose.map { it.toDouble() }, "K" to k, "sharpness" to out.sharpness,
                     "t" to now, "src" to "arcore", "cpuImage" to listOf(dims[0], dims[1])
                 )
+                if (seg != null) map["seg"] = seg
                 main.post { result.success(map) }
             } catch (e: Throwable) {
                 main.post { result.error("encode", e.message, null) }
@@ -257,17 +333,61 @@ class ArCaptureView(private val activity: Activity, private val registry: ArView
         return vp
     }
 
+    private var limbRequests = 0
+
+    /** Where each on-screen grid point lands in the CPU camera image (normalized, landscape), from the camera models
+     *  themselves: screen point -> viewing ray (preview projection) -> physical camera frame -> CPU image intrinsics.
+     *  ARCore's transformCoordinates2d assumes the CPU image covers the same field of view as the preview, which is not
+     *  true for the large 4:3 image we analyse (the outline came out stretched and shifted). */
+    private fun viewToImage(camera: com.google.ar.core.Camera): FloatArray {
+        val proj = FloatArray(16)
+        camera.getProjectionMatrix(proj, 0, 0.03f, 20f)
+        val rel = camera.pose.inverse().compose(camera.displayOrientedPose)  // display camera -> sensor camera
+        val intr = camera.imageIntrinsics
+        val f = intr.focalLength; val c = intr.principalPoint; val dims = intr.imageDimensions
+        val out = FloatArray(viewGrid.size)
+        val d = FloatArray(3); val r = FloatArray(3)
+        for (k in 0 until viewGrid.size / 2) {
+            val ndcX = 2f * viewGrid[2 * k] - 1f; val ndcY = 1f - 2f * viewGrid[2 * k + 1]
+            d[0] = (ndcX + proj[8]) / proj[0]; d[1] = (ndcY + proj[9]) / proj[5]; d[2] = -1f
+            rel.rotateVector(d, 0, r, 0)
+            val z = -r[2]
+            if (z <= 1e-6f) { out[2 * k] = -1f; out[2 * k + 1] = -1f; continue }
+            out[2 * k] = (f[0] * r[0] / z + c[0]) / dims[0]
+            out[2 * k + 1] = (f[1] * -r[1] / z + c[1]) / dims[1]
+        }
+        return out
+    }
+
     private fun requestLimb(frame: com.google.ar.core.Frame, vp: FloatArray) {
         val img = try { frame.acquireCameraImage() } catch (e: Exception) { return }
-        val rgb = try { LimbDetector.sampleRgb(img) } finally { img.close() }
-        val mapped = FloatArray(viewGrid.size)
-        frame.transformCoordinates2d(Coordinates2d.VIEW_NORMALIZED, viewGrid, Coordinates2d.IMAGE_NORMALIZED, mapped)
+        val big = limb.handMode
+        val sw = if (big) LimbDetector.HAND_W else LimbDetector.SMALL_W; val sh = if (big) LimbDetector.HAND_H else LimbDetector.SMALL_H
+        val rgb = try { LimbDetector.sampleRgb(img, sw, sh) } finally { img.close() }
+        val mapped = viewToImage(frame.camera)
+        if (++limbRequests % 50 == 1) {  // diagnostics: ARCore's own view -> CPU image mapping vs ours
+            val ar = FloatArray(viewGrid.size)
+            frame.transformCoordinates2d(Coordinates2d.VIEW_NORMALIZED, viewGrid, Coordinates2d.IMAGE_NORMALIZED, ar)
+            val c = 2 * ((LimbDetector.GRID_H / 2) * LimbDetector.GRID_W + LimbDetector.GRID_W / 2); val e = 0
+            Log.d(TAG, "view->image centre ours ${"%.3f,%.3f".format(mapped[c], mapped[c + 1])} arcore ${"%.3f,%.3f".format(ar[c], ar[c + 1])}" +
+                " | corner ours ${"%.3f,%.3f".format(mapped[e], mapped[e + 1])} arcore ${"%.3f,%.3f".format(ar[e], ar[e + 1])}")
+        }
         val n = viewGrid.size / 2
         val gx = FloatArray(n); val gy = FloatArray(n)
         for (k in 0 until n) {  // landscape image (u, v) -> portrait sample (1 - v, u)
             gx[k] = 1f - mapped[2 * k + 1]; gy[k] = mapped[2 * k]
         }
-        limb.submit(LimbDetector.Request(rgb, LimbDetector.SMALL_W, LimbDetector.SMALL_H, gx, gy, vp)) { emit(it) }
+        val points = try {
+            frame.acquirePointCloud().use { pc ->
+                val b = pc.points; val out = FloatArray(b.remaining() / 4 * 3)
+                var o = 0
+                while (b.remaining() >= 4) { out[o++] = b.get(); out[o++] = b.get(); out[o++] = b.get(); b.get() }
+                out
+            }
+        } catch (e: Exception) { FloatArray(0) }
+        val cp = frame.camera.displayOrientedPose
+        limb.submit(LimbDetector.Request(rgb, sw, sh, gx, gy, vp, points,
+            floatArrayOf(cp.tx(), cp.ty(), cp.tz()))) { emit(it) }
     }
 
     private fun emit(ev: Map<String, Any>) { main.post { registry.sink?.success(ev) } }

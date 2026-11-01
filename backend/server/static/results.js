@@ -1,8 +1,6 @@
 // Results / processing page: status polling, 3D viewer, measurements, reference comparison.
-import * as THREE from 'three';
-import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
-import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { $, api, fmt, ui } from './common.js';
+import { makeViewer, ringColour } from './viewer.js?v=3';
 let viewer = null;
 export function disposeResults() { if (viewer) { viewer.dispose(); viewer = null; } }
 
@@ -18,7 +16,7 @@ export async function scanPage(id) {
     shown = st;
     $('#sp').innerHTML = `<div class="card"><h2>${s.meta.name}</h2>
       <div class="row" style="align-items:center"><div style="flex:3"><div class="bar"><i style="width:${100 * (s.status.progress || 0)}%"></i></div></div><span class="pill ${st === 'failed' ? 'bad' : 'run'}" style="flex:0">${st}</span></div>
-      <p class="small mut">${s.n_input} file(s) uploaded. ${st === 'failed' ? '<b style="color:var(--bad)">' + (s.status.error || '') + '</b>' : 'Processing takes ~10–30 min on this computer. You can close this page.'}</p>
+      <p class="small mut">${s.n_input} file(s) uploaded. ${st === 'failed' ? '<b style="color:var(--bad)">' + (s.status.error || '') + '</b>' : 'Processing takes about 2–3 min. You can close this page.'}</p>
       <pre>${(s.log_tail || []).join('\n')}</pre>
       ${st === 'capturing' ? `<button id="go">Start processing</button>` : ''}
       ${st === 'failed' ? `<button class="sec" id="retry">Retry</button>` : ''}
@@ -51,6 +49,7 @@ function qa(m) {
 }
 
 function renderResult(id, s) {
+  disposeResults();
   const m = s.measurements, L = m.landmarks || {};
   const f = n => `/api/scans/${id}/file/result/${n}`;
   const q = qa(m);
@@ -59,9 +58,17 @@ function renderResult(id, s) {
   <div class="card"><h2>${s.meta.name}</h2>${q.html}
     <div style="margin-top:6px"><span class="pill ${m.mesh.data_coverage_pct >= 90 ? 'ok' : 'bad'}">Surface seen: ${fmt(m.mesh.data_coverage_pct, 0)}%</span>
     <span class="small mut">${m.mesh.data_coverage_pct >= 90 ? 'complete capture' : 'parts of the limb were not seen and are interpolated — rescan with more views of the grey areas / better light'}</span></div></div>
-  <div class="card" style="padding:8px"><div id="viewer"></div>
-    <div class="row" style="padding:8px 4px 2px" id="layers"><button class="sec" data-l="limb">Scan</button>${s.compare.map(c => `<button class="sec" data-l="heat:${c.key}">Δ vs ${c.key.slice(0, 14)}</button>`).join('')}</div>
-    <div class="small mut" style="padding:0 6px 6px" id="legend"></div></div>
+  <div class="card" style="padding:8px" id="vcard"><div id="viewer"><div class="vbar vtop">
+      <button data-v="front">Front</button><button data-v="back">Back</button><button data-v="left">Side</button><button data-v="right">Side</button><button data-v="tips">Tips</button>
+      <span class="sp"></span><button data-a="spin" title="Spin">⟳</button><button data-a="png" title="Save picture">⤓</button><button data-a="full" title="Full screen">⛶</button></div>
+      <div class="vhint">drag: rotate around the arm · two fingers / right-drag: move · pinch / wheel: zoom · double-tap: look at that spot</div></div>
+    <div class="vbar" style="padding:8px 2px 2px"><span class="seg" id="shade"><button data-s="clay" class="on">Shape</button><button data-s="colour">Colour</button><button data-s="wire">Mesh</button></span>
+      <button data-a="rings" id="rbtn">Girth rings</button>
+      <span class="seg" id="layers" ${s.compare.length ? '' : 'hidden'}><button data-l="limb" class="on">Scan</button>${s.compare.map(c => `<button data-l="heat:${c.key}">Δ ${c.key.slice(0, 14)}</button>`).join('')}</span></div>
+    <div class="small mut" style="padding:4px 6px 4px" id="legend"></div></div>
+  <div class="card" id="photos"><div class="row" style="align-items:center;flex-wrap:nowrap"><h2 style="flex:1;margin:0">Photos</h2>
+    <label class="small mut" style="flex:0 0 auto;display:flex;gap:6px;align-items:center"><input type="checkbox" id="ph_out" checked> cut-out in red</label></div>
+    <p class="small mut" id="ph_note" style="margin:6px 0 10px">Loading…</p><div class="phgrid" id="ph_grid"></div></div>
   <div class="card"><h2>Measurements</h2><div class="grid">
     <div class="stat"><div class="v">${fmt(L.wrist?.girth_mm)}</div><div class="k">Wrist girth (mm)</div></div>
     <div class="stat"><div class="v">${fmt(L.wrist_plus_50?.girth_mm)}</div><div class="k">Girth wrist +50 mm</div></div>
@@ -75,14 +82,42 @@ function renderResult(id, s) {
   ${s.compare.length ? `<div class="card"><h2>Accuracy vs reference scans</h2><p class="small mut">Forearm zone (wrist → +170 mm), after rigid alignment. Hand/fingers excluded because posture differs between sessions.</p>
     <table><tr><th>Reference</th><th>Surface median |Δ| mm</th><th>Girth mean |Δ| mm</th><th>Girth bias mm</th><th>Volume Δ</th><th>Coverage</th></tr>${cmpRows}</table></div>` : '<div class="card small mut">Comparing with reference scans…</div>'}
   <div class="card"><h2>Export</h2><div class="row"><a class="btn sec" href="${f('limb.stl')}">STL</a><a class="btn sec" href="${f('limb.obj')}">OBJ</a><a class="btn sec" href="${f('limb.ply')}">PLY (colour)</a><a class="btn sec" href="${f('limb_surface.ply')}">Raw surface</a><a class="btn sec" href="${f('measurements.json')}">Measurements JSON</a></div></div>`;
-  viewer = makeViewer($('#viewer'));
+  viewer = makeViewer($('#viewer'), { centrelineUrl: f('centreline.npy'), landmarks: L });
   viewer.load(f('limb.glb'));
-  document.querySelectorAll('#layers button').forEach(b => b.onclick = () => {
-    const l = b.dataset.l;
-    if (l === 'limb') { viewer.load(f('limb.glb')); $('#legend').textContent = ''; }
-    else { const k = l.split(':')[1]; viewer.load(`/api/scans/${id}/file/compare/${encodeURIComponent("heatmap_" + k + ".glb")}`); $('#legend').innerHTML = 'Deviation from reference: <b style="color:#58f">−3 mm</b> · <b style="color:#3f3">0</b> · <b style="color:#f55">+3 mm</b> · grey = outside ±10 mm'; }
+  const ringLegend = () => Object.entries(L).map(([k, v]) => `<b style="color:${ringColour(k)}">━</b> ${k.replace('wrist_plus_', 'wrist +').replace('hand_max', 'hand max').replace('_', ' ')} ${fmt(v.girth_mm)} mm`).join(' · ');
+  const st = { rings: false, spin: false, layer: 'limb', shade: 'clay' };
+  const legend = () => { $('#legend').innerHTML = [st.layer !== 'limb' ? 'Deviation from reference: <b style="color:#58f">−3 mm</b> · <b style="color:#3f3">0</b> · <b style="color:#f55">+3 mm</b> · grey = outside ±10 mm' : '', st.rings ? ringLegend() : ''].filter(Boolean).join('<br>'); };
+  const seg = (box, b) => { box.querySelectorAll('button').forEach(x => x.classList.toggle('on', x === b)); };
+  document.querySelectorAll('#vcard [data-v]').forEach(b => b.onclick = () => viewer.view(b.dataset.v));
+  $('#shade').querySelectorAll('button').forEach(b => b.onclick = () => { seg($('#shade'), b); const v = b.dataset.s; viewer.setWire(v === 'wire'); viewer.setMode(v === 'colour' ? 'colour' : 'clay'); });
+  $('#layers').querySelectorAll('button').forEach(b => b.onclick = () => { seg($('#layers'), b); st.layer = b.dataset.l;
+    viewer.load(st.layer === 'limb' ? f('limb.glb') : `/api/scans/${id}/file/compare/${encodeURIComponent('heatmap_' + st.layer.split(':')[1] + '.glb')}`, { heat: st.layer !== 'limb' }); legend(); });
+  document.querySelectorAll('#vcard [data-a]').forEach(b => b.onclick = () => {
+    const a = b.dataset.a;
+    if (a === 'rings') { st.rings = !st.rings; b.classList.toggle('on', st.rings); viewer.setRings(st.rings); legend(); }
+    if (a === 'spin') { st.spin = !st.spin; b.classList.toggle('on', st.spin); viewer.setSpin(st.spin); }
+    if (a === 'png') { const l = document.createElement('a'); l.href = viewer.snapshot(); l.download = `${s.meta.name || id}.png`; l.click(); }
+    if (a === 'full') { const c = $('#vcard'); if (document.fullscreenElement) document.exitFullscreen(); else if (c.requestFullscreen) c.requestFullscreen().catch(() => c.classList.toggle('vfull')); else c.classList.toggle('vfull'); }
   });
   drawChart($('#chart'), m, s.compare[0]);
+  photos(id);
+}
+
+// every photo the server used, with its limb cut-out in red (tap: full size); photos left out of the model marked
+async function photos(id) {
+  let r; try { r = await api(`/api/scans/${id}/photos`); } catch (e) { $('#ph_note').textContent = 'Photos not available.'; return; }
+  const out = new Set(r.left_out || []);
+  const src = (n, size) => `/api/scans/${id}/photo/${n}?size=${size}&outline=${$('#ph_out').checked ? 1 : 0}`;
+  const draw = () => {
+    $('#ph_note').textContent = `${r.photos.length} photos in capture order` + (out.size ? ` · ${out.size} left out of the model (crossed)` : '') + '. Tap one to enlarge.';
+    $('#ph_grid').innerHTML = r.photos.map((n, i) => `<figure class="ph${out.has(n) ? ' out' : ''}" data-n="${n}"><img loading="lazy" src="${src(n, 240)}" alt=""><figcaption>${i + 1}</figcaption></figure>`).join('');
+    document.querySelectorAll('#ph_grid .ph').forEach(f => f.onclick = () => {
+      const o = document.createElement('div'); o.className = 'phbox';
+      o.innerHTML = `<img src="${src(f.dataset.n, 1400)}" alt=""><div class="small">${f.dataset.n}${out.has(f.dataset.n) ? ' · left out of the model' : ''} · tap to close</div>`;
+      o.onclick = () => o.remove(); document.body.appendChild(o);
+    });
+  };
+  $('#ph_out').onchange = draw; draw();
 }
 
 function drawChart(c, m, cmp) {
@@ -98,23 +133,5 @@ function drawChart(c, m, cmp) {
   line(xs, ys, '#2f81f7', 2.5);
   if (cmp && m.landmarks.wrist) { const w = m.landmarks.wrist.s_mm; line(cmp.girths.map(g => w + g.s_from_wrist_mm), cmp.girths.map(g => g.ref_mm), '#d29922', 1.5); x.fillStyle = '#d29922'; x.fillText('reference ' + cmp.reference, W - 200, 14); }
   for (const [k, v] of Object.entries(m.landmarks).filter(([k, v]) => v.s_mm <= x1)) { x.fillStyle = '#3fb950'; x.beginPath(); x.arc(X(v.s_mm), Y(v.girth_mm), 4, 0, 7); x.fill(); x.fillText(k.replace('wrist_plus_', 'W+').replace('_max', ''), X(v.s_mm) + 5, Y(v.girth_mm) - 6); }
-}
-
-function makeViewer(el) {
-  const r = new THREE.WebGLRenderer({ antialias: true }); r.setPixelRatio(devicePixelRatio); r.setSize(el.clientWidth, el.clientHeight); el.appendChild(r.domElement);
-  const sc = new THREE.Scene(); sc.background = new THREE.Color(0x0b0f14);
-  const cam = new THREE.PerspectiveCamera(40, el.clientWidth / el.clientHeight, 1, 10000);
-  sc.add(new THREE.HemisphereLight(0xffffff, 0x334455, 1.6)); const dl = new THREE.DirectionalLight(0xffffff, 1.2); cam.add(dl); sc.add(cam);
-  const ctl = new OrbitControls(cam, r.domElement); ctl.enableDamping = true;
-  let obj = null, alive = true; const loader = new GLTFLoader();
-  const onR = () => { cam.aspect = el.clientWidth / el.clientHeight; cam.updateProjectionMatrix(); r.setSize(el.clientWidth, el.clientHeight); }; addEventListener('resize', onR);
-  (function an() { if (!alive) return; ctl.update(); r.render(sc, cam); requestAnimationFrame(an); })();
-  return {
-    load(url) { loader.load(url, g => { if (obj) sc.remove(obj); obj = g.scene;
-      obj.traverse(o => { if (o.isMesh) { o.geometry.computeVertexNormals(); o.material = new THREE.MeshStandardMaterial({ vertexColors: !!o.geometry.attributes.color, roughness: .75, metalness: 0, side: THREE.DoubleSide }); } });
-      sc.add(obj); const b = new THREE.Box3().setFromObject(obj), c = b.getCenter(new THREE.Vector3()), s = b.getSize(new THREE.Vector3()).length();
-      ctl.target.copy(c); if (!this._placed) { cam.position.copy(c).add(new THREE.Vector3(0, -s * 1.3, s * .8)); cam.up.set(0, 0, 1); this._placed = true; } cam.near = s / 100; cam.far = s * 20; cam.updateProjectionMatrix(); }); },
-    dispose() { alive = false; removeEventListener('resize', onR); r.dispose(); el.innerHTML = ''; }
-  };
 }
 

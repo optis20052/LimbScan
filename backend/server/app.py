@@ -27,6 +27,11 @@ PY = sys.executable
 
 app = FastAPI(title='LimbScan')
 jobs_q: 'queue.Queue[str]' = queue.Queue()
+# photos are prepared (resize, limb masks, limb features) while the phone is still uploading: see limbscan/prefetch.py
+prefetch_q: 'queue.Queue[tuple[str, Path]]' = queue.Queue()
+prefetch_pending: dict[str, int] = {}
+prefetch_lock = threading.Lock()
+PREFETCH = os.environ.get('LIMBSCAN_PREFETCH', '1') == '1'
 
 
 def scan_dir(sid):
@@ -46,26 +51,89 @@ def references():
     return out
 
 
+def prefetcher():
+    sys.path.insert(0, str(ROOT))
+    from limbscan import prefetch
+    while True:
+        sid, photo = prefetch_q.get()
+        try:
+            prefetch.process(DATA / 'scans' / sid, photo)
+        except Exception as e:  # the pipeline computes anything missing itself
+            print('prefetch failed', photo, e)
+        finally:
+            with prefetch_lock:
+                prefetch_pending[sid] = prefetch_pending.get(sid, 1) - 1
+
+
+def _wait_prefetch(sid, limit=30.0):
+    """Let the last photos finish preparing before the pipeline starts (else both would do the same work)."""
+    t = time.time()
+    while time.time() - t < limit:
+        with prefetch_lock:
+            if prefetch_pending.get(sid, 0) <= 0:
+                return
+        time.sleep(0.1)
+
+
 def worker():
     while True:
         sid = jobs_q.get()
+        _wait_prefetch(sid)
         d = DATA / 'scans' / sid
         meta = json.loads((d / 'meta.json').read_text())
         meta['started'] = time.time(); (d / 'meta.json').write_text(json.dumps(meta))
         with open(d / 'pipeline.out', 'a') as f:
             subprocess.run([PY, '-m', 'limbscan.pipeline', str(d)], cwd=ROOT, stdout=f, stderr=subprocess.STDOUT)
         st = json.loads((d / 'status.json').read_text()) if (d / 'status.json').exists() else {}
-        if st.get('stage') == 'done':
-            for ref in references():
-                try:
-                    subprocess.run([PY, '-m', 'limbscan.compare', str(d / 'result' / 'limb_surface.ply'), str(ref), str(d / 'compare')],
-                                   cwd=ROOT, stdout=open(d / 'compare.out', 'a'), stderr=subprocess.STDOUT, timeout=900)
-                except Exception as e:  # noqa
-                    print('compare failed', e)
         meta['finished'] = time.time(); (d / 'meta.json').write_text(json.dumps(meta))
+        if st.get('stage') == 'done' and os.environ.get('LIMBSCAN_GS_HOST'):
+            detail_q.put(d)  # palm + fingers from 2DGS on the GPU PC (~15 min): the quick result is already there
+        if st.get('stage') == 'done' and os.environ.get('LIMBSCAN_AUTO_COMPARE') == '1':
+            # off by default: comparing every scan with every reference keeps all CPU cores busy for minutes; run
+            # limbscan.compare by hand for validation scans
+            compare_q.put(d)
+
+
+compare_q: 'queue.Queue[Path]' = queue.Queue()
+detail_q: 'queue.Queue[Path]' = queue.Queue()
+
+
+def detailer():
+    """One detail pass at a time (limbscan/detail.py); the scan's status says 'detail': running / done / failed."""
+    while True:
+        d = detail_q.get()
+        def mark(state):
+            p = d / 'status.json'
+            st = json.loads(p.read_text()) if p.exists() else {}
+            st['detail'] = state
+            p.write_text(json.dumps(st))
+        mark('running')
+        with open(d / 'detail.out', 'a') as f:
+            r = subprocess.run([PY, '-m', 'limbscan.detail', str(d)], cwd=ROOT, stdout=f, stderr=subprocess.STDOUT, timeout=3600)
+        mark('done' if r.returncode == 0 else 'failed')
+
+_THREAD_VARS = ('OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS', 'NUMBA_NUM_THREADS')
+
+
+def comparer():
+    while True:
+        d = compare_q.get()
+        for ref in references():
+            try:
+                # lowest priority and a few cores: a research side job must not load the PC (or slow the next scan)
+                subprocess.run(['nice', '-n', '19', PY, '-m', 'limbscan.compare', str(d / 'result' / 'limb_surface.ply'), str(ref),
+                                str(d / 'compare')], cwd=ROOT, stdout=open(d / 'compare.out', 'a'), stderr=subprocess.STDOUT,
+                               timeout=900, env={**os.environ, **{k: '2' for k in _THREAD_VARS}})
+            except Exception as e:  # noqa
+                print('compare failed', e)
 
 
 threading.Thread(target=worker, daemon=True).start()
+threading.Thread(target=comparer, daemon=True).start()
+threading.Thread(target=detailer, daemon=True).start()
+if PREFETCH:  # a few in parallel: a photo takes ~0.8 s to prepare, the phone sends one every ~0.5 s
+    for _ in range(int(os.environ.get('LIMBSCAN_PREFETCH_THREADS', 4))):
+        threading.Thread(target=prefetcher, daemon=True).start()
 
 
 @app.get('/', response_class=HTMLResponse)
@@ -117,6 +185,10 @@ async def upload(sid: str, files: list[UploadFile] = File(...), meta: str = Form
         if meta and len(files) == 1:
             json.loads(meta)  # validate
             dst.with_suffix('.json').write_text(meta)
+        if PREFETCH:
+            with prefetch_lock:
+                prefetch_pending[sid] = prefetch_pending.get(sid, 0) + 1
+            prefetch_q.put((sid, dst))
         n += 1
     return {'received': n, 'total': len([p for p in (d / 'input').iterdir() if p.suffix != '.json'])}
 
@@ -135,12 +207,28 @@ async def upload_chunk(sid: str, name: str = Form(...), index: int = Form(...), 
 
 
 @app.post('/api/scans/{sid}/start')
-def start(sid: str):
+def start(sid: str, arm: str = Form('')):
     d = scan_dir(sid)
     if not any((d / 'input').iterdir()):
         raise HTTPException(400, 'no images uploaded')
+    if arm:  # the arm as the phone finally placed it (refined while scanning): every photo is cut out with it
+        a = json.loads(arm)
+        (d / 'arm.json').write_text(json.dumps({k: a[k] for k in ('a', 'b', 'r')}))
     (d / 'status.json').write_text(json.dumps({'stage': 'queued', 'progress': 0, 'position': jobs_q.qsize() + 1}))
     jobs_q.put(sid)
+    return {'ok': True}
+
+
+@app.post('/api/log')
+def device_log(session: str = Form(...), text: str = Form(...)):
+    """The phone's own log for one capture session (sent during and after a scan, also when it is discarded)."""
+    d = DATA / 'logs'
+    d.mkdir(parents=True, exist_ok=True)
+    name = re.sub(r'[^A-Za-z0-9_.-]', '_', session)[:80] or 'unknown'
+    (d / f'{name}.txt').write_text(text[-600000:])
+    sd = DATA / 'scans' / name
+    if sd.is_dir():
+        (sd / 'device_log.txt').write_text(text[-600000:])
     return {'ok': True}
 
 
@@ -211,6 +299,45 @@ def get_file(sid: str, kind: str, name: str):
     if not p.exists():
         raise HTTPException(404)
     return FileResponse(p, filename=name)
+
+
+@app.get('/api/scans/{sid}/photos')
+def list_photos(sid: str):
+    """The photos the server used (capture order), and which were left out of the model."""
+    d = scan_dir(sid)
+    names = sorted(p.name for p in (d / 'images').glob('*.jpg')) if (d / 'images').exists() else []
+    bad = json.loads((d / 'colmap' / 'bad_masks.json').read_text()) if (d / 'colmap' / 'bad_masks.json').exists() else []
+    return {'photos': names, 'left_out': bad}
+
+
+@app.get('/api/scans/{sid}/photo/{name}')
+def get_photo(sid: str, name: str, size: int = 360, outline: int = 1):
+    """One photo as a JPEG (thumbnail when size < full width), with the limb cut-out drawn in red when outline=1.
+    Cached on disk next to the scan."""
+    import cv2
+    import numpy as np
+    d = scan_dir(sid)
+    if not re.fullmatch(r'[\w.-]+\.jpg', name) or '..' in name:
+        raise HTTPException(400)
+    src = d / 'images' / name
+    if not src.exists():
+        raise HTTPException(404)
+    size = max(120, min(int(size), 2000))
+    cache = d / 'thumbs' / f'{Path(name).stem}_{size}_{int(bool(outline))}.jpg'
+    if not cache.exists():
+        img = cv2.imread(str(src))
+        h, w = img.shape[:2]
+        if outline:
+            m = cv2.imread(str(d / 'colmap' / 'mask_mvs' / (Path(name).stem + '.png')), cv2.IMREAD_GRAYSCALE)
+            if m is not None:
+                m = cv2.resize(m, (w, h), interpolation=cv2.INTER_NEAREST)
+                c, _ = cv2.findContours((m > 127).astype(np.uint8), cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
+                cv2.drawContours(img, c, -1, (40, 40, 255), max(2, w // 360))
+        if size < w:
+            img = cv2.resize(img, (size, int(h * size / w)), interpolation=cv2.INTER_AREA)
+        cache.parent.mkdir(exist_ok=True)
+        cv2.imwrite(str(cache), img, [cv2.IMWRITE_JPEG_QUALITY, 85])
+    return FileResponse(cache, media_type='image/jpeg', headers={'Cache-Control': 'max-age=3600'})
 
 
 @app.delete('/api/scans/{sid}')

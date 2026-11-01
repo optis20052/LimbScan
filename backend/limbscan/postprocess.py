@@ -13,6 +13,10 @@ from .measure import measure
 TABLE_CLEAR_MM = 12.0   # everything closer than this to the marker plane is table/mat
 
 
+QUALITY_GATE = os.environ.get('LIMBSCAN_QUALITY_GATE', '1') == '1'
+QUALITY_MIN = float(os.environ.get('LIMBSCAN_QUALITY_MIN', '0.9'))
+
+
 def _cameras(dense):
     import pycolmap
     rec = pycolmap.Reconstruction(Path(dense) / 'sparse')
@@ -64,8 +68,16 @@ def _largest_component(mesh):
     return max(parts, key=lambda p: p.area) if len(parts) else mesh
 
 
-def _robust_planes(P, Q, k, chunk=20000):
-    """For each query point: robust local plane (centre c, normal n, median height) from its k neighbours in P."""
+def _robust_planes(P, Q, k):
+    """For each query point: robust local plane (centre c, normal n, median height) from its k neighbours in P
+    (compiled, multi-core; identical to _robust_planes_np)."""
+    from .fastgeo import robust_planes
+    _, idx = cKDTree(P).query(Q, k=k, workers=-1)
+    return robust_planes(np.ascontiguousarray(P, dtype=np.float64), idx)
+
+
+def _robust_planes_np(P, Q, k, chunk=20000):
+    """Reference numpy version of _robust_planes."""
     tree = cKDTree(P)
     C = np.empty_like(Q); Nn = np.empty_like(Q); H = np.empty(len(Q))
     for a in range(0, len(Q), chunk):
@@ -94,6 +106,14 @@ def skin_surface(P, k_wide=120, k=48, hair_mm=0.8):
     own = np.einsum('mi,mi->m', P - C, Nn) - H
     keep = np.abs(own) < hair_mm
     P = P[keep]
+    if os.environ.get('LIMBSCAN_SKIN_FIT', 'plane') == 'quadric':
+        # robust local quadric instead of a plane: a plane sits below a convex surface's apex (r^2 / 4R, ~0.15 mm
+        # at the wrist), which shrank girths; the quadric follows the curvature
+        from .fastgeo import quadric_offsets
+        P = np.ascontiguousarray(P, dtype=np.float64)
+        _, nn = cKDTree(P).query(P, k=k, workers=-1)
+        n, f = quadric_offsets(P, np.arange(len(P)), P, nn)
+        return P + n * f[:, None], keep
     C, Nn, H = _robust_planes(P, P, k)
     own = np.einsum('mi,mi->m', P - C, Nn) - H
     return P - Nn * own[:, None], keep
@@ -116,8 +136,10 @@ def build_meshes(job, limb_pts, limb_col, C):
     if lab.max() >= 0:
         pc = pc.select_by_index(np.where(lab == np.bincount(lab[lab >= 0]).argmax())[0])
     pc.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=4, max_nn=40))
-    pc.orient_normals_consistent_tangent_plane(30)
-    Q, N = np.asarray(pc.points), np.asarray(pc.normals)
+    from .fastgeo import orient_normals
+    Q = np.asarray(pc.points)
+    N = orient_normals(Q, np.asarray(pc.normals))  # consistent signs (open3d's tangent-plane MST is 12x slower)
+    pc.normals = o3d.utility.Vector3dVector(N)
     _, ci = cKDTree(C).query(Q)  # global sign: surface faces the cameras
     if (((C[ci] - Q) * N).sum(1) > 0).mean() < 0.5:
         pc.normals = o3d.utility.Vector3dVector(-N)
@@ -147,10 +169,23 @@ def _quadric_denoise(V, mask, k=110, iters=4, chunk=8000, support_mm=2.0):
     """Robust local quadric fit (z = ax2+bxy+cy2+dx+ey+f in each point's tangent frame, Huber-reweighted) and
     projection of the point onto it. Removes bumps a few mm wide (hair clumps, stereo noise) while keeping the
     limb's curvature, so girths don't shrink the way a plane-based smoother would make them."""
-    V = V.copy()
+    from .fastgeo import quadric_offsets
+    V = np.array(V, dtype=np.float64)
     idx_all = np.where(mask > 0.05)[0]
     for _ in range(iters):
         # support set at ~2 mm spacing, so k neighbours always span a fixed ~12 mm patch, whatever the mesh density
+        sup = np.asarray(o3d.geometry.PointCloud(o3d.utility.Vector3dVector(V)).voxel_down_sample(support_mm).points)
+        _, nn = cKDTree(sup).query(V[idx_all], k=k, workers=-1)
+        n, f = quadric_offsets(V, idx_all, sup, nn)  # compiled, multi-core; same maths as _quadric_denoise_np
+        V[idx_all] = V[idx_all] + n * (f * mask[idx_all])[:, None]
+    return V
+
+
+def _quadric_denoise_np(V, mask, k=110, iters=4, chunk=8000, support_mm=2.0):
+    """Reference numpy version of _quadric_denoise."""
+    V = V.copy()
+    idx_all = np.where(mask > 0.05)[0]
+    for _ in range(iters):
         sup = np.asarray(o3d.geometry.PointCloud(o3d.utility.Vector3dVector(V)).voxel_down_sample(support_mm).points)
         tree = cKDTree(sup)
         for a in range(0, len(idx_all), chunk):
@@ -207,10 +242,38 @@ def clean_model(job, closed, surf, cl, faces=400000, wrist_s=None):
     wt_steps = [('poisson', m.is_watertight)]
     from .measure import extend_past_elbow
     ext = extend_past_elbow(surf, cl)
+    if len(ext) and len(cl) >= 6:
+        # the extension may follow the elbow's bend, but never turn back toward the hand: on a real arm it once did,
+        # the cuts below then faced the wrong way and the exported model kept only the elbow end (1 Nov, scan a065)
+        t_cl = cl[-1] - cl[-6]; t_cl /= np.linalg.norm(t_cl)
+        steps = np.diff(np.vstack([cl[-1:], ext]), axis=0)
+        fwd = (steps @ t_cl) > 0.5 * np.linalg.norm(steps, axis=1)
+        bad = np.where(~fwd)[0]
+        if len(bad):
+            job.log(f'[model] extension past the measured limb turned back after {bad[0] * 5} mm: stopped there')
+            ext = ext[:bad[0]]
     full_cl = np.vstack([cl, ext]) if len(ext) else cl
     job.log(f'[model] limb followed {len(ext) * 5} mm past the measured segment (elbow / upper arm)')
     if len(full_cl) >= 6:
+        # the line followed along the limb can stop short of the end of the real surface (31 Oct, a real arm: 55 mm
+        # short - the exported model lost that much forearm): continue it straight to where the real data ends, so
+        # both cuts below happen there
         t = full_cl[-1] - full_cl[-6]; t /= np.linalg.norm(t)
+        S = np.asarray(surf.vertices)
+        rel = S - full_cl[-1]
+        along = rel @ t
+        near = np.linalg.norm(rel - along[:, None] * t, axis=1) < 80.0
+        if (near & (along > 0)).sum() > 200:
+            reach = float(np.percentile(along[near & (along > 0)], 99))
+            if reach > 15.0:
+                job.log(f'[model] real surface continues {reach:.0f} mm past the followed line: line extended')
+                full_cl = np.vstack([full_cl, full_cl[-1] + np.arange(5.0, reach + 1e-6, 5.0)[:, None] * t])
+    if len(full_cl) >= 6:
+        t = full_cl[-1] - full_cl[-6]; t /= np.linalg.norm(t)
+        if len(cl) >= 6:
+            t_cl = cl[-1] - cl[-6]; t_cl /= np.linalg.norm(t_cl)
+            if t @ t_cl < 0.5:  # the cut always faces away from the hand
+                t = t_cl
         origin = full_cl[-1] - 8.0 * t
         try:
             cut = m.slice_plane(origin, -t, cap=True)
@@ -228,9 +291,15 @@ def clean_model(job, closed, surf, cl, faces=400000, wrist_s=None):
         end_zone = arc[ci] > arc[-1] - 80.0
         balloon = end_zone & (dd > 4.0)
         if balloon.sum() > 20:
-            a0 = np.percentile(arc[ci][balloon], 2) - 5.0
+            # never into the measured limb: a few stray points near the end moved this cut 55 mm into the forearm
+            # (31 Oct, a real arm: same measurements, but the exported model lost its forearm)
+            a0 = max(np.percentile(arc[ci][balloon], 2) - 5.0, arc[len(cl) - 1])
             k = int(np.clip(np.searchsorted(arc, a0), 3, len(full_cl) - 2))
             t = full_cl[k + 1] - full_cl[k - 3]; t /= np.linalg.norm(t)
+            if len(cl) >= 6:
+                t_cl = cl[-1] - cl[-6]; t_cl /= np.linalg.norm(t_cl)
+                if t @ t_cl < 0.5:
+                    t = t_cl
             cut = m.slice_plane(full_cl[k], -t, cap=True)
             if cut is not None and len(cut.faces) > 1000:
                 cut = _largest_component(cut)
@@ -371,9 +440,77 @@ def finalize(job, dense, scale_stats):
     sel, focus = isolate(P, col, N, C, D, log=job.log, table=scale_stats.get('mode') != 'arm')
     surf, full, closed = build_meshes(job, P[sel], col[sel], C)
     surf = decimate(surf, 600000)
+    masks = job.root / 'colmap' / 'mask_mvs'
+    if scale_stats.get('mode') == 'arm' and masks.exists() and os.environ.get('LIMBSCAN_HULL', '1') == '1':
+        # the shape from the limb's outlines in every photo (texture-free, closed), stereo only for hollows:
+        # stereo alone is lumpy and full of holes on smooth skin / plain surfaces
+        from .hull import limb_hull
+        try:
+            h = limb_hull(job.root / 'colmap' / 'metric', masks, surf, closed, log=job.log)
+        except Exception as e:  # noqa: BLE001
+            job.log(f'[hull] failed ({e}): keeping the stereo surface')
+            h = None
+        if h is None and QUALITY_GATE and (job.root / 'colmap' / 'masks_tracked').exists():
+            # the photos do not agree on one shape: the limb moved or the fingers changed during the scan. A model
+            # from the stereo surface alone would look plausible and be wrong - say so instead (medical use)
+            raise RuntimeError('The hand moved or the fingers changed position during the scan: the photos do not '
+                               'show one shape. Scan again with the elbow resting on a table, the fingers spread and '
+                               'kept completely still.')
+        model = None
+        if h is not None:
+            from . import shape
+            if shape.available() and shape.CAMFIX:
+                # cameras lined up with the outlines first, then the outline model carved again with them
+                try:
+                    model = shape.fix_cameras(job, h, log=job.log)
+                    if model is not None:
+                        h2 = limb_hull(model, masks, surf, closed, log=job.log)
+                        if h2 is not None:
+                            h = h2
+                        else:
+                            model = None
+                except Exception as e:  # noqa: BLE001
+                    job.log(f'[camfix] failed ({e}): keeping the cameras')
+                    model = None
+        if h is not None:
+            surf = closed = h
+            # the hollows the outlines cannot see (palm, knuckles, thumb web) from the torch shading, on the GPU
+            from . import shape
+            if shape.available():
+                try:
+                    r = shape.refine(job, h, log=job.log, model=model)
+                except Exception as e:  # noqa: BLE001
+                    job.log(f'[shape] failed ({e}): keeping the outline hull')
+                    r = None
+                if r is not None:
+                    h.export(out / 'limb_hull.ply')
+                    surf = closed = r
     surf.export(out / 'limb_surface.ply')
+    if QUALITY_GATE and (job.root / 'colmap' / 'masks_tracked').exists():
+        from .quality import photo_agreement
+        med, per = photo_agreement(job.root / 'colmap' / 'metric', masks, surf)
+        if med is not None:
+            job.log(f'[quality] the model matches its photos: median overlap {med:.3f}, worst {min(per.values()):.3f}')
+            if med < QUALITY_MIN:
+                raise RuntimeError(f'The model does not match its own photos (overlap {med:.2f}, good scans 0.95+): the '
+                                   'hand moved or the fingers changed position during the scan. Scan again with the '
+                                   'elbow resting on a table, the fingers spread and kept completely still.')
     # measure on real data only; unseen arcs are completed per section (see measure._complete_polar)
-    meas = measure(surf)
+    tip = axis = None
+    lmf, model = job.root / 'hand_landmarks.json', job.root / 'colmap' / 'metric'
+    if lmf.exists() and model.exists():
+        # the hand triangulated with the model's own cameras (mm, the mesh's frame): measure along the real hand ->
+        # forearm axis, distal end at the fingertips
+        from .handarm import arm_in_model
+        try:
+            arm = arm_in_model(model, json.loads(lmf.read_text()), log=job.log)
+        except Exception as e:  # noqa: BLE001
+            job.log(f'[arm] triangulation in the model failed: {e}')
+            arm = None
+        if arm is not None:
+            tip = np.asarray(arm['b'], float)
+            axis = (np.asarray(arm['wrist'], float), np.asarray(arm['a'], float) - np.asarray(arm['b'], float))
+    meas = measure(surf, tip=tip, axis=axis)
     if meas['length_mm'] < 120:
         raise RuntimeError(f"Only a small part of the limb could be reconstructed ({meas['length_mm']:.0f} mm long). "
                            'Usually the arm or hand moved during the scan, or the light was behind the arm. '
@@ -393,11 +530,23 @@ def finalize(job, dense, scale_stats):
     disp = decimate(wt, 150000)
     try:
         from .texture import colorize
-        disp = colorize(disp, dense / 'sparse', dense / 'images', log=job.log)
+        model, masks = job.root / 'colmap' / 'metric', job.root / 'colmap' / 'mask_mvs'
+        if model.exists() and masks.exists() and (job.root / 'images').exists():
+            # the full-size photos (the stereo copies are small and grey-painted around the limb)
+            disp = colorize(disp, model, job.root / 'images', masks, log=job.log)
+        else:
+            disp = colorize(disp, dense / 'sparse', dense / 'images', log=job.log)
     except Exception as e:
         job.log(f'[texture] skipped: {e}')
+    seen = disp.metadata.pop('seen', None)  # (not into the exported files)
     disp.export(out / 'limb.glb')
     disp.export(out / 'limb_textured.ply')
+    if seen is not None:
+        from .texture import evidence
+        ev, meas['evidence'] = evidence(disp, seen)
+        ev.export(out / 'evidence.glb')
+        job.log(f"[evidence] {meas['evidence']['pct_well_seen']}% of the surface seen head-on by 4+ photos, "
+                f"{meas['evidence']['pct_weak']}% by 2-3, {meas['evidence']['pct_unseen']}% by fewer")
     meas['scale'] = {k: v for k, v in scale_stats.items() if k != 'edge_lengths_mm'}
     meas['mesh'] = {'faces': int(len(wt.faces)), 'watertight': bool(wt.is_watertight),
                     'surface_area_cm2': float(wt.area / 100), 'bbox_mm': wt.extents.round(1).tolist(),
