@@ -421,6 +421,9 @@ class ScanArc {
     return k < 0 || k >= dots ? null : k;
   }
 
+  /// Photos a dot needs. The walk starts at the first dot, so only the half of it ahead of the phone can get any.
+  static int need(int k) => k == 0 ? perDot - 1 : perDot;
+
   /// Good photos taken at each dot.
   List<int> get dotCounts {
     final c = List.filled(dots, 0);
@@ -431,13 +434,13 @@ class ScanArc {
     return c;
   }
 
-  bool dotDone(int k) => dotCounts[k] >= perDot;
+  bool dotDone(int k) => dotCounts[k] >= need(k);
 
   /// The first dot still open (the one to go to), or null when all are done.
   int? get nextDot {
     final c = dotCounts;
     for (var k = 0; k < dots; k++) {
-      if (c[k] < perDot) return k;
+      if (c[k] < need(k)) return k;
     }
     return null;
   }
@@ -453,11 +456,16 @@ class ScanArc {
   bool wants(double el) {
     if (photos >= maxPhotos) return false;
     final k = dotAt(position);
-    if (k != null && dotCounts[k] < perDot && (_shotPos == null || (position - _shotPos!).abs() >= 1.0)) return true;
+    if (k != null && !dotDone(k) && (_shotPos == null || (position - _shotPos!).abs() >= 1.0)) return true;
     return _shotPos == null || (position - _shotPos!).abs() >= spacing || (el - _shotEl!).abs() >= lift;
   }
 
-  bool duplicate(Vec3 pos, Vec3 fwd) => isDuplicate(shots, pos, fwd);
+  /// A photo here repeats one already taken. Closer photos are allowed at an open dot: 3.5 cm apart, under 4 fit in a
+  /// dot at 38 cm (scan 0dc8), so each turned green 8 degrees past it and any dot left one short meant walking back.
+  bool duplicate(Vec3 pos, Vec3 fwd) {
+    final k = dotAt(position);
+    return isDuplicate(shots, pos, fwd, minMove: k != null && !dotDone(k) ? 0.02 : 0.035);
+  }
 
   void add(double el, Vec3 pos, Vec3 fwd) {
     shots.add(Shot(pos, fwd, 0));
@@ -467,7 +475,7 @@ class ScanArc {
   }
 
   int get photos => shots.length;
-  int get dotsDone => dotCounts.where((c) => c >= perDot).length;
+  int get dotsDone => [for (var k = 0; k < dots; k++) if (dotDone(k)) k].length;
   double get progress => dotsDone / dots;
   bool get complete => nextDot == null;
   bool get canFinish => dotsDone >= dots - 3 && photos >= 20;

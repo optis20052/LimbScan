@@ -85,6 +85,7 @@ def worker():
         with open(d / 'pipeline.out', 'a') as f:
             subprocess.run([PY, '-m', 'limbscan.pipeline', str(d)], cwd=ROOT, stdout=f, stderr=subprocess.STDOUT)
         st = json.loads((d / 'status.json').read_text()) if (d / 'status.json').exists() else {}
+        meta = json.loads((d / 'meta.json').read_text())  # read again: the scan may have been renamed meanwhile
         meta['finished'] = time.time(); (d / 'meta.json').write_text(json.dumps(meta))
         if st.get('stage') == 'done' and os.environ.get('LIMBSCAN_GS_HOST'):
             detail_q.put(d)  # palm + fingers from 2DGS on the GPU PC (~15 min): the quick result is already there
@@ -338,6 +339,19 @@ def get_photo(sid: str, name: str, size: int = 360, outline: int = 1):
         cache.parent.mkdir(exist_ok=True)
         cv2.imwrite(str(cache), img, [cv2.IMWRITE_JPEG_QUALITY, 85])
     return FileResponse(cache, media_type='image/jpeg', headers={'Cache-Control': 'max-age=3600'})
+
+
+@app.post('/api/scans/{sid}/name')
+def rename_scan(sid: str, name: str = Form(...)):
+    name = ' '.join(name.split())[:80]
+    if not name:
+        raise HTTPException(400, 'empty name')
+    d = scan_dir(sid)
+    meta = json.loads((d / 'meta.json').read_text())
+    meta['name'] = name
+    tmp = d / 'meta.json.tmp'
+    tmp.write_text(json.dumps(meta)); tmp.replace(d / 'meta.json')
+    return {'name': name}
 
 
 @app.delete('/api/scans/{sid}')

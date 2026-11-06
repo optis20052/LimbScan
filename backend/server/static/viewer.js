@@ -45,6 +45,19 @@ function section(geo, p, n, rmax) {
   return new Float32Array(out);
 }
 
+// The backend writes vertex colours as plain sRGB bytes (photo pixels); three.js takes a mesh's COLOR_0 as linear,
+// so without this every colour came out brighter and paler than in the photos.
+function linearColours(geo) {
+  const a = geo.attributes.color;
+  if (!a) return;
+  const n = a.count, k = a.itemSize, out = new Float32Array(n * 3), c = new THREE.Color();
+  for (let i = 0; i < n; i++) {
+    c.setRGB(a.getX(i), a.getY(i), a.getZ(i), THREE.SRGBColorSpace);  // -> linear working space
+    out[3 * i] = c.r; out[3 * i + 1] = c.g; out[3 * i + 2] = c.b;
+  }
+  geo.setAttribute('color', new THREE.BufferAttribute(out, 3));
+}
+
 export function makeViewer(el, { centrelineUrl, landmarks } = {}) {
   el.style.position = 'relative';
   const r = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
@@ -68,7 +81,9 @@ export function makeViewer(el, { centrelineUrl, landmarks } = {}) {
   const loader = new GLTFLoader(), meshes = [];
 
   const clay = new THREE.MeshStandardMaterial({ color: 0xd9cfc4, roughness: 0.55, metalness: 0, side: THREE.DoubleSide, envMapIntensity: 0.7, polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1 });
-  const colour = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.8, metalness: 0, side: THREE.DoubleSide, envMapIntensity: 0.5, polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1 });
+  // photo colour as the photos show it: unlit (the photos already hold the real light and shade; lighting them
+  // again, plus tone mapping, washed the skin out to a pale grey-white)
+  const colour = new THREE.MeshBasicMaterial({ vertexColors: true, toneMapped: false, side: THREE.DoubleSide, polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1 });
   const wireMat = new THREE.MeshBasicMaterial({ color: 0x0b0f14, wireframe: true, transparent: true, opacity: 0.16 });
 
   function frame() {
@@ -173,6 +188,7 @@ export function makeViewer(el, { centrelineUrl, landmarks } = {}) {
       model.clear(); meshes.length = 0;
       g.scene.traverse(o => { if (!o.isMesh) return;
         const geo = o.geometry.clone().applyMatrix4(o.matrixWorld); geo.computeVertexNormals();
+        linearColours(geo);
         const m = new THREE.Mesh(geo); m.userData.heat = heat;
         if (heat) m.userData.heatMat = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.7, metalness: 0, side: THREE.DoubleSide, envMapIntensity: 0.4 });
         m.add(new THREE.Mesh(geo, wireMat)); meshes.push(m); model.add(m); });

@@ -93,6 +93,8 @@ def _gpu_run(work, args):
 
 NORMALS = os.environ.get('LIMBSCAN_NORMALS', '1') == '1'  # MoGe normals on the palm and back of the hand
 NORM_THICK = float(os.environ.get('LIMBSCAN_NORM_THICK', '24'))
+NORM_RAMP = float(os.environ.get('LIMBSCAN_NORM_RAMP', '8'))  # mm of thickness over which normals fade in
+NORM_SOFT = float(os.environ.get('LIMBSCAN_NORM_SOFT', '3'))  # mm: the weights smoothed over the surface
 W_NORM = float(os.environ.get('LIMBSCAN_W_NORM', '50'))
 MOGE_IMAGE = os.environ.get('LIMBSCAN_MOGE_IMAGE', 'limbmoge3')
 
@@ -163,11 +165,24 @@ def _normal_weights(job, hull, prep, model=None, log=print):
         sc.add_triangles(o3d.core.Tensor(V.astype(np.float32)), o3d.core.Tensor(np.asarray(hull.faces, np.uint32)))
         rays = np.c_[V - N * 0.5, -N].astype(np.float32)
         thick = sc.cast_rays(o3d.core.Tensor(rays))['t_hit'].numpy() + 0.5  # inf where nothing is hit
-        w *= thick > NORM_THICK
+        w *= np.clip((thick - NORM_THICK + NORM_RAMP / 2) / NORM_RAMP, 0, 1)
+        if NORM_SOFT > 0:
+            # faded in over a few mm, not switched on at a line: a hard edge at the finger bases let the palm move
+            # while the finger beside it held still, and the surface folded there (1 Nov, f8d0: a slash at the
+            # base of the ring finger)
+            import scipy.sparse as sp
+            import scipy.sparse.linalg as spl
+            E = hull.edges_unique
+            n = len(V)
+            A = sp.coo_matrix((np.ones(2 * len(E)), (np.r_[E[:, 0], E[:, 1]], np.r_[E[:, 1], E[:, 0]])), shape=(n, n)).tocsr()
+            el = float(np.median(hull.edges_unique_length))
+            L = sp.diags(np.asarray(A.sum(1)).ravel()) - A
+            w = spl.splu((sp.eye(n) + (NORM_SOFT / el) ** 2 * L).tocsc()).solve(w.astype(np.float64)).clip(0, 1)
+            w = w.astype(np.float32)
     z = dict(np.load(prep))
     z['w_norm_v'] = w
     np.savez(prep, **z)
-    log(f'[shape] photo normals act on {100 * w.mean():.0f}% of the surface (palm and back of the hand)')
+    log(f'[shape] photo normals act on {100 * w.mean():.0f}% of the surface (palm and back of the hand, faded in)')
 
 
 def fix_cameras(job, hull, log=print):

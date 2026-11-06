@@ -39,8 +39,9 @@ enum Stage { place, fitting, confirm, calibrate, scan, done }
 ///    finding the arm in the camera image again (that was the jittery, lost-arm part).
 /// 2. Walk: the user walks once around the hand, from one side of the person round the front to the other, keeping
 ///    the hand on screen. Photos are taken automatically every few degrees when the whole hand is on screen, close
-///    and steady. A dial shows the walk (green: done, amber: still to go) and one instruction says which way. Done at
-///    200 degrees: the body and the head block the rest, so nothing more is asked.
+///    and steady. A ring around the hand on the camera image shows the walk (green: done, amber: still to go), and an
+///    arrow and one instruction beside the hand say which way. Done at 200 degrees: the body and the head block the
+///    rest, so nothing more is asked.
 ///
 /// Scale comes from the phone's AR tracking (no card). Each photo carries a point on the arm (the cylinder's middle
 /// projected into it) so the server cuts out the right object: a real arm or a printed model, same flow.
@@ -679,11 +680,11 @@ class _CaptureScreenState extends State<CaptureScreen> with TickerProviderStateM
     } else if (_arc.mustGoBack) {
       // an open dot behind: back to it (the opposite way to the walk)
       final back = _go == 'left' ? 'right' : 'left';
-      _setHint(Hint('Go back to the amber dot ($back)', Tone.warn, back == 'left' ? Icons.west_rounded : Icons.east_rounded));
+      _setHint(Hint('Go back to the $back', Tone.warn, back == 'left' ? Icons.west_rounded : Icons.east_rounded));
     } else if (_arc.walkDir == null) {
-      _setHint(const Hint('Good. Now walk slowly around the hand', Tone.good, Icons.motion_photos_on_rounded));
+      _setHint(const Hint('Walk slowly left or right', Tone.good, Icons.swap_horiz_rounded));
     } else {
-      _setHint(Hint('Walk slowly to the next dot$go', Tone.good, _go == 'left' ? Icons.west_rounded : Icons.east_rounded));
+      _setHint(Hint('Walk slowly$go', Tone.good, _go == 'left' ? Icons.west_rounded : Icons.east_rounded));
     }
     if (_warm &&
         inView &&
@@ -891,8 +892,9 @@ class _CaptureScreenState extends State<CaptureScreen> with TickerProviderStateM
   }
 
   // ---- UI -----------------------------------------------------------------------------------------------------
-  // The camera with the arm's cylinder (green where done), a slim top bar, and one card at the bottom: before the
-  // scan "tap the arm", while scanning the dial and one instruction. No buttons needed while scanning.
+  // The camera, a slim top bar, and one card at the bottom. Before the scan the card says what to do; while scanning
+  // the guidance is on the camera image around the hand (WalkHud), so the eyes stay on the hand, and the card only
+  // holds the counts and Complete.
   @override
   Widget build(BuildContext context) {
     final pad = MediaQuery.paddingOf(context);
@@ -901,9 +903,9 @@ class _CaptureScreenState extends State<CaptureScreen> with TickerProviderStateM
     // The camera in a FIXED frame with the camera image's own 9:16 proportions (nothing cropped), sized once from
     // the screen: the instruction bar above it and the guide card below never change
     // its size (a frame that followed the card's height reset ARCore's display geometry mid-scan and broke tracking).
-    // No 3D guide drawn on the arm: the dial in the card shows the progress.
+    // No 3D guide drawn on the arm: the ring around the hand shows the progress.
     final size = MediaQuery.sizeOf(context);
-    const topH = 60.0, bottomH = 112.0, aspect = 9 / 16; // the camera image's own proportions (portrait)
+    const topH = 60.0, bottomH = 72.0, aspect = 9 / 16; // the camera image's own proportions (portrait)
     final camH = size.height - pad.top - 8 - topH - 8 - bottomH - pad.bottom - 20;
     final camW = math.min(size.width - 16, camH * aspect);
     final camHf = camW / aspect;
@@ -932,6 +934,27 @@ class _CaptureScreenState extends State<CaptureScreen> with TickerProviderStateM
         if (_stage == Stage.place || _stage == Stage.confirm)
           Positioned.fill(child: IgnorePointer(child: CustomPaint(painter: _HandPainter(_handN)))),
         if (scanning) const Positioned.fill(child: IgnorePointer(child: Center(child: _Crosshair()))),
+        if (scanning)
+          Positioned.fill(
+            child: IgnorePointer(
+              child: WalkHud(
+                arc: _arc,
+                tick: _poseN,
+                pulse: _pulse,
+                text: _hint.text,
+                icon: _hint.icon,
+                colour: _toneColour,
+                // the hints that name a way to go carry these icons
+                arrow: switch (_hint.icon) {
+                  Icons.west_rounded => -1,
+                  Icons.east_rounded => 1,
+                  Icons.swap_horiz_rounded => 2,
+                  _ => 0,
+                },
+                mirror: _go == 'left',
+              ),
+            ),
+          ),
         if (banner != null) Positioned(left: 12, right: 12, top: 12, child: _Banner(text: banner)),
       ],
     );
@@ -1083,73 +1106,44 @@ class _CaptureScreenState extends State<CaptureScreen> with TickerProviderStateM
     );
   }
 
-  /// While scanning: the walk dial (done, still to go, which way) beside one big instruction, and Complete.
+  Color get _toneColour => switch (_hint.tone) {
+    Tone.good => kGreen,
+    Tone.info => Colors.white,
+    Tone.warn => C.amber,
+  };
+
+  /// While scanning: only the counts and Complete, nothing that needs reading while walking.
   Widget _scanCard() {
     final up = _uploads;
-    final tone = switch (_hint.tone) {
-      Tone.good => kGreen,
-      Tone.info => Colors.white,
-      Tone.warn => C.amber,
-    };
     final failed = (up?.failed ?? 0) > 0;
     final n = _arc.photos;
+    final muted = TextStyle(color: Colors.white.withValues(alpha: 0.7), fontSize: 14);
     return Glass(
-      padding: const EdgeInsets.fromLTRB(12, 12, 10, 8),
-      child: Row(
-        children: [
-          ArcDial(arc: _arc, tick: _poseN, pulse: _pulse),
-          const SizedBox(width: 14),
-          Expanded(
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                AnimatedSwitcher(
-                  duration: const Duration(milliseconds: 200),
-                  transitionBuilder: (c, a) => FadeTransition(opacity: a, child: c),
-                  layoutBuilder: (current, previous) => current ?? const SizedBox.shrink(), // never two texts on top
-                  child: Row(
-                    key: ValueKey(_hint.text),
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Icon(_hint.icon, color: tone, size: 28),
-                      const SizedBox(width: 8),
-                      Expanded(
-                        child: Text(
-                          _hint.text,
-                          style: TextStyle(color: tone, fontSize: 20, fontWeight: FontWeight.w800, height: 1.15),
-                        ),
-                      ),
-                    ],
-                  ),
+      padding: const EdgeInsets.fromLTRB(16, 4, 10, 4),
+      child: SizedBox(
+        height: 44,
+        child: Row(
+          children: [
+            Text('${_arc.dotsDone}/${ScanArc.dots} dots · $n photos', style: muted),
+            const SizedBox(width: 6),
+            if (failed)
+              const Icon(Icons.cloud_off_rounded, size: 16, color: C.red)
+            else if ((up?.uploaded ?? 0) < n)
+              Icon(Icons.cloud_upload_rounded, size: 16, color: Colors.white.withValues(alpha: 0.6))
+            else if (n > 0)
+              const Icon(Icons.cloud_done_rounded, size: 16, color: kGreen),
+            const Spacer(),
+            if (n >= 10)
+              FilledButton(
+                onPressed: _finishing ? null : _finish,
+                style: FilledButton.styleFrom(
+                  backgroundColor: _arc.canFinish ? kGreen : Colors.white24,
+                  visualDensity: VisualDensity.compact,
                 ),
-                const SizedBox(height: 8),
-                Row(
-                  children: [
-                    Text('$n photos', style: TextStyle(color: Colors.white.withValues(alpha: 0.7), fontSize: 13)),
-                    const SizedBox(width: 6),
-                    if (failed)
-                      const Icon(Icons.cloud_off_rounded, size: 16, color: C.red)
-                    else if ((up?.uploaded ?? 0) < n)
-                      Icon(Icons.cloud_upload_rounded, size: 16, color: Colors.white.withValues(alpha: 0.6))
-                    else if (n > 0)
-                      const Icon(Icons.cloud_done_rounded, size: 16, color: kGreen),
-                    const Spacer(),
-                    if (n >= 10)
-                      FilledButton(
-                        onPressed: _finishing ? null : _finish,
-                        style: FilledButton.styleFrom(
-                          backgroundColor: _arc.canFinish ? kGreen : Colors.white24,
-                          visualDensity: VisualDensity.compact,
-                        ),
-                        child: const Text('Complete'),
-                      ),
-                  ],
-                ),
-              ],
-            ),
-          ),
-        ],
+                child: const Text('Complete'),
+              ),
+          ],
+        ),
       ),
     );
   }

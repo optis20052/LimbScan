@@ -1,6 +1,6 @@
-import { $, api, fmt, ui } from './common.js';
+import { $, api, fmt, ui, esc, renameScan } from './common.js?v=6';
 import { S } from './sketches.js';
-import { scanPage, disposeResults } from './results.js?v=4';
+import { scanPage, disposeResults } from './results.js?v=7';
 
 const app = $('#app');
 const store = { get: k => { try { return localStorage.getItem(k); } catch (e) { return null; } }, set: (k, v) => { try { localStorage.setItem(k, v); } catch (e) { } } };
@@ -37,9 +37,14 @@ async function home() {
   $('#file').onchange = e => uploadFiles([...e.target.files]);
   const scans = await api('/api/scans');
   $('#list').innerHTML = scans.length ? scans.map(s => `
-    <div class="item" data-id="${s.id}"><div><div>${s.name}</div><div class="small mut">${new Date(s.created * 1000).toLocaleString()}${s.summary ? ` · wrist ${fmt(s.summary.wrist_girth_mm)} mm` : ''}</div></div>
+    <div class="item" data-id="${s.id}"><div><div><span class="nm">${esc(s.name)}</span> <button class="sec ren" title="Rename">✎</button></div><div class="small mut">${new Date(s.created * 1000).toLocaleString()}${s.summary ? ` · wrist ${fmt(s.summary.wrist_girth_mm)} mm` : ''}</div></div>
     <span class="pill ${s.stage === 'done' ? 'ok' : s.stage === 'failed' ? 'bad' : 'run'}">${s.stage || '…'}</span></div>`).join('') : '<span class="mut">No scans yet.</span>';
   document.querySelectorAll('.item').forEach(e => e.onclick = () => location.hash = '/scan/' + e.dataset.id);
+  document.querySelectorAll('.item .ren').forEach(b => b.onclick = async ev => {
+    ev.stopPropagation();
+    const it = b.closest('.item'), nm = it.querySelector('.nm');
+    try { const n = await renameScan(it.dataset.id, nm.textContent); if (n) nm.textContent = n; } catch (e) { alert('Rename failed: ' + e.message); }
+  });
 }
 
 async function newScan() { const fd = new FormData(); fd.append('name', 'Scan ' + new Date().toLocaleString()); return (await api('/api/scans', { method: 'POST', body: fd })).id; }

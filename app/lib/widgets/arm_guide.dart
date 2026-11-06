@@ -302,71 +302,151 @@ class _DialPainter extends CustomPainter {
   bool shouldRepaint(covariant _DialPainter o) => true;
 }
 
-/// The walk round the hand as target dots on an arc (open at the bottom): the first dot is where the scan started.
-/// Green: done (enough good photos from there). Amber, pulsing: the next dot to go to. Grey: still ahead. The white
-/// marker is the phone now.
-class ArcDial extends StatelessWidget {
-  const ArcDial({super.key, required this.arc, required this.tick, required this.pulse, this.size = 112});
+/// What the eyes need while walking, drawn on the camera image around the hand so they never have to leave it: the walk
+/// as a ring along the frame, around the hand (green: done, amber: next, white circle: where the phone is now), an arrow beside the hand
+/// when a way to go is known, one short instruction below it, and the frame in the instruction's colour, which is
+/// seen without looking at it (green: keep going, amber: read this).
+class WalkHud extends StatelessWidget {
+  const WalkHud({
+    super.key,
+    required this.arc,
+    required this.tick,
+    required this.pulse,
+    required this.text,
+    required this.icon,
+    this.colour = Colors.white,
+    this.arrow = 0,
+    this.mirror = false,
+  });
 
   final ScanArc arc;
   final Listenable tick;
   final Animation<double> pulse;
-  final double size;
+  final String text;
+  final IconData icon;
+  final Color colour;
+  final int arrow; // -1 left, +1 right, 2 either way, 0 none
+  final bool mirror; // walking left: the ring runs right to left, the way the phone really moves
+
+  Widget _chevron(int side) => Align(
+    alignment: Alignment(0.6 * side, 0),
+    child: AnimatedBuilder(
+      animation: pulse,
+      builder: (_, child) => Transform.translate(offset: Offset(side * 8 * pulse.value, 0), child: child),
+      child: Icon(
+        side < 0 ? Icons.keyboard_double_arrow_left_rounded : Icons.keyboard_double_arrow_right_rounded,
+        size: 56,
+        color: colour,
+        shadows: const [Shadow(blurRadius: 8, color: Colors.black87)],
+      ),
+    ),
+  );
 
   @override
-  Widget build(BuildContext context) => SizedBox(
-    width: size,
-    height: size,
-    child: CustomPaint(painter: _ArcPainter(arc, pulse, Listenable.merge([tick, pulse]))),
+  Widget build(BuildContext context) => Stack(
+    fit: StackFit.expand,
+    children: [
+      CustomPaint(painter: _ArcPainter(arc, pulse, mirror, Listenable.merge([tick, pulse]))),
+      if (arrow == -1 || arrow == 2) _chevron(-1),
+      if (arrow == 1 || arrow == 2) _chevron(1),
+      Align(
+        alignment: const Alignment(0, 0.66),
+        child: AnimatedSwitcher(
+          duration: const Duration(milliseconds: 200),
+          layoutBuilder: (current, previous) => current ?? const SizedBox.shrink(), // never two texts on top
+          child: Container(
+            key: ValueKey(text),
+            margin: const EdgeInsets.symmetric(horizontal: 14),
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 9),
+            decoration: BoxDecoration(color: Colors.black.withValues(alpha: 0.6), borderRadius: BorderRadius.circular(16)),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(icon, color: colour, size: 24),
+                const SizedBox(width: 8),
+                Flexible(
+                  child: Text(
+                    text,
+                    maxLines: 2,
+                                        style: TextStyle(color: colour, fontSize: 18, fontWeight: FontWeight.w800, height: 1.15),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+      AnimatedContainer(
+        duration: const Duration(milliseconds: 200),
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(18),
+          border: Border.all(color: colour, width: 4),
+        ),
+      ),
+    ],
   );
 }
 
 class _ArcPainter extends CustomPainter {
-  _ArcPainter(this.a, this.pulse, Listenable repaint) : super(repaint: repaint);
+  _ArcPainter(this.a, this.pulse, this.mirror, Listenable repaint) : super(repaint: repaint);
   final ScanArc a;
   final Animation<double> pulse;
+  final bool mirror;
   static const _from = 150 * math.pi / 180, _sweep = 240 * math.pi / 180; // open at the bottom
 
   @override
   void paint(Canvas canvas, Size size) {
     final c = size.center(Offset.zero);
-    final r = size.width / 2 - 10;
+    // an oval along the frame: all around the hand, never over it (photos need the whole hand on screen)
+    final rx = size.width / 2 - 18, ry = size.height / 2 - 18;
     Offset at(double f) {
-      final t = _from + _sweep * f.clamp(0.0, 1.0);
-      return c + Offset(math.cos(t), math.sin(t)) * r;
+      final t = _from + _sweep * (mirror ? 1 - f.clamp(0.0, 1.0) : f.clamp(0.0, 1.0));
+      return c + Offset(rx * math.cos(t), ry * math.sin(t));
     }
 
-    canvas.drawArc(Rect.fromCircle(center: c, radius: r), _from, _sweep, false, Paint()
+    // over the camera image: everything has a dark edge, so it reads on skin, a white wall or a dark room alike
+    final edge = Paint()..color = Colors.black.withValues(alpha: 0.45);
+    final rect = Rect.fromCenter(center: c, width: 2 * rx, height: 2 * ry);
+    canvas.drawArc(rect, _from, _sweep, false, Paint()
       ..style = PaintingStyle.stroke
-      ..strokeWidth = 3
-      ..color = Colors.white.withValues(alpha: 0.18));
+      ..strokeWidth = 5
+      ..color = Colors.black.withValues(alpha: 0.3));
+    canvas.drawArc(rect, _from, _sweep, false, Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 2.5
+      ..color = Colors.white.withValues(alpha: 0.45));
     final counts = a.dotCounts, next = a.nextDot;
+    final free = a.walkDir == null; // no way chosen yet: the walk can start from either end of the ring
     for (var k = 0; k < ScanArc.dots; k++) {
       final p = at(k / (ScanArc.dots - 1));
-      final done = counts[k] >= ScanArc.perDot;
+      final end = k == 0 || k == ScanArc.dots - 1;
+      final done = counts[k] >= ScanArc.need(k) && !free;
+      canvas.drawCircle(p, 9.5, edge);
       if (done) {
-        canvas.drawCircle(p, 7.5, Paint()..color = kGreen);
-      } else if (k == next) {
-        canvas.drawCircle(p, 7.5 + 3 * pulse.value, Paint()..color = C.amber.withValues(alpha: 0.35));
-        canvas.drawCircle(p, 7.5, Paint()..color = C.amber);
+        canvas.drawCircle(p, 8, Paint()..color = kGreen);
+      } else if (free ? end : k == next) {
+        canvas.drawCircle(p, 9 + 5 * pulse.value, Paint()..color = C.amber.withValues(alpha: 0.4));
+        canvas.drawCircle(p, 8, Paint()..color = C.amber);
       } else {
-        canvas.drawCircle(p, 6, Paint()..color = Colors.white.withValues(alpha: 0.3));
+        canvas.drawCircle(p, 6, Paint()..color = Colors.white.withValues(alpha: 0.6));
+      }
+      // photos so far at an open dot: it fills up green while the phone is there
+      if (!done && !free && counts[k] > 0) {
+        final slice = Rect.fromCircle(center: p, radius: 8);
+        canvas.drawArc(slice, -math.pi / 2, 2 * math.pi * counts[k] / ScanArc.need(k), true, Paint()..color = kGreen);
       }
     }
+    if (free) return;
     // you: where the phone is on the walk now
     final me = at(a.position / ScanArc.target);
-    canvas.drawCircle(me, 4.5, Paint()
+    canvas.drawCircle(me, 12, Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 5
+      ..color = Colors.black.withValues(alpha: 0.5));
+    canvas.drawCircle(me, 12, Paint()
       ..style = PaintingStyle.stroke
       ..strokeWidth = 3
       ..color = Colors.white);
-    final tp = TextPainter(
-      text: TextSpan(
-        text: '${a.dotsDone}/${ScanArc.dots}',
-        style: const TextStyle(color: Colors.white, fontSize: 20, fontWeight: FontWeight.w800),
-      ),
-      textDirection: TextDirection.ltr,
-    )..layout();
-    tp.paint(canvas, c - Offset(tp.width / 2, tp.height / 2));
   }
 
   @override

@@ -328,4 +328,43 @@ void main() {
       expect(poseChange(handPose(hand())!, handPose(hand(bend: 0.6))!), greaterThan(20));
     });
   });
+
+  group('walk dots', () {
+    // the phone walks a circle of [radius] m round the hand at [speed] degrees a second, photos at most every [gap] s
+    ({ScanArc arc, List<double?> greenAt, bool back}) walk(double radius, double speed, {double gap = 0.33}) {
+      final arc = ScanArc();
+      final greenAt = List<double?>.filled(ScanArc.dots, null);
+      var last = -10.0, back = false;
+      for (var t = 0.0; t < 40 && !arc.complete; t += 0.02) {
+        final az = speed * t, a = az * math.pi / 180;
+        final pos = [radius * math.sin(a), 0.0, radius * math.cos(a)];
+        final fwd = [-math.sin(a), 0.0, -math.cos(a)];
+        arc.track(az, (t * 1000).round());
+        back = back || arc.mustGoBack;
+        if (t - last >= gap && arc.wants(0) && !arc.duplicate(pos, fwd)) {
+          arc.add(0, pos, fwd);
+          last = t;
+          for (var k = 0; k < ScanArc.dots; k++) {
+            if (greenAt[k] == null && arc.dotDone(k)) greenAt[k] = arc.position - k * ScanArc.dotStep;
+          }
+        }
+      }
+      return (arc: arc, greenAt: greenAt, back: back);
+    }
+
+    for (final radius in [0.30, 0.38, 0.45]) {
+      test('one walk at $radius m fills every dot, each about when the phone reaches it', () {
+        final r = walk(radius, 11);
+        expect(r.arc.complete, isTrue);
+        expect(r.back, isFalse);
+        // degrees past the dot when it turned green: 8 with photos 3.5 cm apart at every dot (scan 0dc8)
+        expect(r.greenAt.skip(1).map((g) => g!).reduce(math.max), lessThan(6));
+        expect(r.arc.photos, inInclusiveRange(43, 62));
+      });
+    }
+
+    test('a slower walk turns a dot green as the phone reaches it', () {
+      expect(walk(0.38, 6).greenAt.skip(1).map((g) => g!).reduce(math.max), lessThan(3));
+    });
+  });
 }

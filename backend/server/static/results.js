@@ -1,8 +1,17 @@
 // Results / processing page: status polling, 3D viewer, measurements, reference comparison.
-import { $, api, fmt, ui } from './common.js';
-import { makeViewer, ringColour } from './viewer.js?v=3';
+import { $, api, fmt, ui, esc, renameScan } from './common.js?v=6';
+import { makeViewer, ringColour } from './viewer.js?v=6';
 let viewer = null;
 export function disposeResults() { if (viewer) { viewer.dispose(); viewer = null; } }
+
+// the scan's name with a rename button next to it
+const title = n => `<div class="ttl"><h2 id="sname">${esc(n)}</h2><button class="sec" id="rename" title="Rename">✎ Rename</button></div>`;
+function nameButton(id, s) {
+  $('#rename').onclick = async () => {
+    try { const n = await renameScan(id, s.meta.name); if (n) { s.meta.name = n; $('#sname').textContent = n; } }
+    catch (e) { alert('Rename failed: ' + e.message); }
+  };
+}
 
 // ---------------- scan page ----------------
 export async function scanPage(id) {
@@ -14,13 +23,14 @@ export async function scanPage(id) {
     const st = s.status.stage;
     if (st === 'done' && s.measurements) { if (shown !== 'done' || (s.compare.length && !shown_cmp)) { shown = 'done'; shown_cmp = s.compare.length > 0; renderResult(id, s); } if (shown_cmp) clearInterval(ui.pollTimer); return; }
     shown = st;
-    $('#sp').innerHTML = `<div class="card"><h2>${s.meta.name}</h2>
+    $('#sp').innerHTML = `<div class="card">${title(s.meta.name)}
       <div class="row" style="align-items:center"><div style="flex:3"><div class="bar"><i style="width:${100 * (s.status.progress || 0)}%"></i></div></div><span class="pill ${st === 'failed' ? 'bad' : 'run'}" style="flex:0">${st}</span></div>
       <p class="small mut">${s.n_input} file(s) uploaded. ${st === 'failed' ? '<b style="color:var(--bad)">' + (s.status.error || '') + '</b>' : 'Processing takes about 2–3 min. You can close this page.'}</p>
       <pre>${(s.log_tail || []).join('\n')}</pre>
       ${st === 'capturing' ? `<button id="go">Start processing</button>` : ''}
       ${st === 'failed' ? `<button class="sec" id="retry">Retry</button>` : ''}
       <button class="sec" id="del" style="margin-top:8px">Delete</button></div>`;
+    nameButton(id, s);
     $('#go') && ($('#go').onclick = () => api(`/api/scans/${id}/start`, { method: 'POST' }));
     $('#retry') && ($('#retry').onclick = () => api(`/api/scans/${id}/start`, { method: 'POST' }));
     $('#del').onclick = async () => { if (confirm('Delete scan?')) { await fetch('/api/scans/' + id, { method: 'DELETE' }); location.hash = '/'; } };
@@ -55,14 +65,14 @@ function renderResult(id, s) {
   const q = qa(m);
   const cmpRows = s.compare.map(c => `<tr><td>${c.reference}</td><td>${fmt(c.surface_median_abs_mm, 2)}</td><td>${fmt(c.girth_mean_abs_diff_mm, 1)}</td><td>${fmt(c.girth_mean_diff_mm, 1)}</td><td>${fmt(c.zone_volume_diff_pct, 1)}%</td><td>${fmt(c.coverage_pct_within_3mm, 0)}%</td></tr>`).join('');
   $('#sp').innerHTML = `
-  <div class="card"><h2>${s.meta.name}</h2>${q.html}
+  <div class="card">${title(s.meta.name)}${q.html}
     <div style="margin-top:6px"><span class="pill ${m.mesh.data_coverage_pct >= 90 ? 'ok' : 'bad'}">Surface seen: ${fmt(m.mesh.data_coverage_pct, 0)}%</span>
     <span class="small mut">${m.mesh.data_coverage_pct >= 90 ? 'complete capture' : 'parts of the limb were not seen and are interpolated — rescan with more views of the grey areas / better light'}</span></div></div>
   <div class="card" style="padding:8px" id="vcard"><div id="viewer"><div class="vbar vtop">
       <button data-v="front">Front</button><button data-v="back">Back</button><button data-v="left">Side</button><button data-v="right">Side</button><button data-v="tips">Tips</button>
       <span class="sp"></span><button data-a="spin" title="Spin">⟳</button><button data-a="png" title="Save picture">⤓</button><button data-a="full" title="Full screen">⛶</button></div>
       <div class="vhint">drag: rotate around the arm · two fingers / right-drag: move · pinch / wheel: zoom · double-tap: look at that spot</div></div>
-    <div class="vbar" style="padding:8px 2px 2px"><span class="seg" id="shade"><button data-s="clay" class="on">Shape</button><button data-s="colour">Colour</button><button data-s="wire">Mesh</button></span>
+    <div class="vbar" style="padding:8px 2px 2px"><span class="seg" id="shade"><button data-s="clay">Shape</button><button data-s="colour" class="on">Colour</button><button data-s="wire">Mesh</button></span>
       <button data-a="rings" id="rbtn">Girth rings</button>
       <span class="seg" id="layers" ${s.compare.length ? '' : 'hidden'}><button data-l="limb" class="on">Scan</button>${s.compare.map(c => `<button data-l="heat:${c.key}">Δ ${c.key.slice(0, 14)}</button>`).join('')}</span></div>
     <div class="small mut" style="padding:4px 6px 4px" id="legend"></div></div>
@@ -83,6 +93,7 @@ function renderResult(id, s) {
     <table><tr><th>Reference</th><th>Surface median |Δ| mm</th><th>Girth mean |Δ| mm</th><th>Girth bias mm</th><th>Volume Δ</th><th>Coverage</th></tr>${cmpRows}</table></div>` : '<div class="card small mut">Comparing with reference scans…</div>'}
   <div class="card"><h2>Export</h2><div class="row"><a class="btn sec" href="${f('limb.stl')}">STL</a><a class="btn sec" href="${f('limb.obj')}">OBJ</a><a class="btn sec" href="${f('limb.ply')}">PLY (colour)</a><a class="btn sec" href="${f('limb_surface.ply')}">Raw surface</a><a class="btn sec" href="${f('measurements.json')}">Measurements JSON</a></div></div>`;
   viewer = makeViewer($('#viewer'), { centrelineUrl: f('centreline.npy'), landmarks: L });
+  viewer.setMode('colour');  // colour by default; scans without colour fall back to the shape view
   viewer.load(f('limb.glb'));
   const ringLegend = () => Object.entries(L).map(([k, v]) => `<b style="color:${ringColour(k)}">━</b> ${k.replace('wrist_plus_', 'wrist +').replace('hand_max', 'hand max').replace('_', ' ')} ${fmt(v.girth_mm)} mm`).join(' · ');
   const st = { rings: false, spin: false, layer: 'limb', shade: 'clay' };
@@ -96,9 +107,10 @@ function renderResult(id, s) {
     const a = b.dataset.a;
     if (a === 'rings') { st.rings = !st.rings; b.classList.toggle('on', st.rings); viewer.setRings(st.rings); legend(); }
     if (a === 'spin') { st.spin = !st.spin; b.classList.toggle('on', st.spin); viewer.setSpin(st.spin); }
-    if (a === 'png') { const l = document.createElement('a'); l.href = viewer.snapshot(); l.download = `${s.meta.name || id}.png`; l.click(); }
+    if (a === 'png') { const l = document.createElement('a'); l.href = viewer.snapshot(); l.download = `${(s.meta.name || id).replace(/[\\/:*?"<>|]/g, '_')}.png`; l.click(); }
     if (a === 'full') { const c = $('#vcard'); if (document.fullscreenElement) document.exitFullscreen(); else if (c.requestFullscreen) c.requestFullscreen().catch(() => c.classList.toggle('vfull')); else c.classList.toggle('vfull'); }
   });
+  nameButton(id, s);
   drawChart($('#chart'), m, s.compare[0]);
   photos(id);
 }
